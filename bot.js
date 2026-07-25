@@ -294,7 +294,15 @@ await ensureBucket();
 const app = express();
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
-app.use(webhookCallback(bot, "express"));
+// timeoutMilliseconds увеличен, потому что генерация сценария/фото через Gemini
+// иногда занимает дольше стандартных 10 секунд — с дефолтом grammy обрывал обработку.
+app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
+
+// Страховка: если где-то всё же вылетит необработанный reject (например, реальный
+// сетевой сбой), процесс не должен падать целиком и валить весь бот для всех пользователей.
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection (процесс продолжает работать):", err);
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
