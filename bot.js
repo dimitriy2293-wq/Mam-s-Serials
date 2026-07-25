@@ -131,45 +131,78 @@ bot.on("message:text", async (ctx, next) => {
     }
 
     ctx.session.draft.script = script;
-    ctx.session.step = "awaiting_character_choice";
+    ctx.session.draft.locations = (script.locations || []).map((l) => ({
+      name: l.name,
+      description: l.description,
+      image_url: null,
+    }));
+    ctx.session.draft.locationQueueIndex = 0;
+    ctx.session.step = "awaiting_location_step";
 
-    const kb = new InlineKeyboard()
-      .text("Свои персонажи (пришлю фото)", "chars_own")
-      .text("Сгенерировать персонажей", "chars_ai");
-
-    const charList = script.characters.map((c) => c.name).join(", ");
-    await ctx.reply(
-      `Вот разбивка по сценам:\n\n${formatScriptPreview(script)}\n\n` +
-      `Персонажи в сюжете: ${charList}\n\nПерсонажей — свои или сгенерировать?`,
-      { reply_markup: kb }
-    );
+    await ctx.reply(`Вот разбивка по сценам:\n\n${formatScriptPreview(script)}`);
+    await askLocationStep(ctx);
     return;
   }
 
-  if (step === "awaiting_character_name") {
-    // Пользователь только что прислал фото, теперь пишет имя для него
-    const name = ctx.message.text.trim();
-    const pendingPhoto = ctx.session.draft.pendingPhotoUrl;
-    ctx.session.draft.characters.push({
-      name,
-      source: "user_upload",
-      ref_image_url: pendingPhoto,
-    });
-    ctx.session.step = "awaiting_character_photos";
-
-    const remaining = ctx.session.draft.script.characters
-      .map((c) => c.name)
-      .filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
-
-    if (remaining.length > 0) {
-      await ctx.reply(
-        `Добавлен персонаж "${name}". Осталось: ${remaining.join(", ")}.\n` +
-        `Пришли следующее фото, или /done если персонажей больше нет (недостающие будут сгенерированы ИИ).`
-      );
-    } else {
-      await ctx.reply(`Все персонажи собраны. Можно жать /done.`);
-    }
+  if (step === "awaiting_location_description") {
+    const idx = ctx.session.draft.locationQueueIndex;
+    ctx.session.draft.locations[idx].description = ctx.message.text.trim();
+    ctx.session.draft.locationQueueIndex += 1;
+    ctx.session.step = "awaiting_location_step";
+    await ctx.reply("Описание сохранено, фон будет сгенерирован по нему.");
+    await askLocationStep(ctx);
+    return;
   }
+
+});
+
+// ---------- Настройка фона для каждой локации: ИИ, своё фото или своё описание ----------
+async function askLocationStep(ctx) {
+  const { locations, locationQueueIndex } = ctx.session.draft;
+  if (locationQueueIndex >= locations.length) {
+    return askCharacterChoice(ctx);
+  }
+  const loc = locations[locationQueueIndex];
+  const kb = new InlineKeyboard()
+    .text("Сгенерировать ИИ", "loc_ai")
+    .text("Своё фото", "loc_photo")
+    .row()
+    .text("Своё описание", "loc_desc");
+  await ctx.reply(
+    `Локация «${loc.name}»: ${loc.description}\n\nКак задать фон для неё?`,
+    { reply_markup: kb }
+  );
+}
+
+async function askCharacterChoice(ctx) {
+  ctx.session.step = "awaiting_character_choice";
+  const script = ctx.session.draft.script;
+  const kb = new InlineKeyboard()
+    .text("Свои персонажи (пришлю фото)", "chars_own")
+    .text("Сгенерировать персонажей", "chars_ai");
+  const charList = script.characters.map((c) => c.name).join(", ");
+  await ctx.reply(
+    `Персонажи в сюжете: ${charList}\n\nПерсонажей — свои или сгенерировать?`,
+    { reply_markup: kb }
+  );
+}
+
+bot.callbackQuery("loc_ai", async (ctx) => {
+  await safeAnswer(ctx);
+  ctx.session.draft.locationQueueIndex += 1;
+  await askLocationStep(ctx);
+});
+
+bot.callbackQuery("loc_photo", async (ctx) => {
+  await safeAnswer(ctx);
+  ctx.session.step = "awaiting_location_photo";
+  await ctx.reply("Пришли фото фона для этой локации.");
+});
+
+bot.callbackQuery("loc_desc", async (ctx) => {
+  await safeAnswer(ctx);
+  ctx.session.step = "awaiting_location_description";
+  await ctx.reply("Опиши локацию своими словами — сгенерирую фон по этому описанию вместо варианта от ИИ.");
 });
 
 bot.callbackQuery("chars_own", async (ctx) => {
@@ -179,7 +212,7 @@ bot.callbackQuery("chars_own", async (ctx) => {
   const names = ctx.session.draft.script.characters.map((c) => c.name).join(", ");
   await ctx.reply(
     `Пришли фото персонажа(ей) по одному (${names}). ` +
-    `После каждого фото напиши, кто это (имя из сценария). Когда закончишь — /done.`
+    `После каждого фото я покажу кнопки — выберешь, кто это. Когда закончишь — /done.`
   );
 });
 
@@ -199,17 +232,70 @@ bot.callbackQuery("chars_ai", async (ctx) => {
   }
 });
 
-// ---------- Приём фото персонажей (несколько, по одному за раз) ----------
+// ---------- Приём фото (фон локации ИЛИ персонаж, в зависимости от шага) ----------
 bot.on("message:photo", async (ctx) => {
+  if (ctx.session.step === "awaiting_location_photo") {
+    const fileId = ctx.message.photo.at(-1).file_id;
+    const file = await ctx.api.getFile(fileId);
+    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+
+    const idx = ctx.session.draft.locationQueueIndex;
+    ctx.session.draft.locations[idx].image_url = url;
+    ctx.session.draft.locationQueueIndex += 1;
+    ctx.session.step = "awaiting_location_step";
+    await ctx.reply("Фон сохранён.");
+    await askLocationStep(ctx);
+    return;
+  }
+
   if (ctx.session.step !== "awaiting_character_photos") return;
 
   const fileId = ctx.message.photo.at(-1).file_id;
   const file = await ctx.api.getFile(fileId);
   const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-
   ctx.session.draft.pendingPhotoUrl = url;
-  ctx.session.step = "awaiting_character_name";
-  await ctx.reply("Как зовут этого персонажа? (используй имя из сценария выше)");
+
+  const allNames = ctx.session.draft.script.characters.map((c) => c.name);
+  const remaining = allNames.filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
+
+  if (remaining.length === 0) {
+    await ctx.reply("Все персонажи уже собраны — это фото не понадобится. Можно жать /done.");
+    return;
+  }
+
+  const kb = new InlineKeyboard();
+  remaining.forEach((name, i) => {
+    kb.text(name, `char_pick:${allNames.indexOf(name)}`);
+    if (i % 2 === 1) kb.row();
+  });
+  await ctx.reply("Кто это?", { reply_markup: kb });
+});
+
+// ---------- Привязка присланного фото к персонажу по кнопке ----------
+bot.callbackQuery(/^char_pick:/, async (ctx) => {
+  await safeAnswer(ctx);
+  const idx = parseInt(ctx.callbackQuery.data.split(":")[1], 10);
+  const name = ctx.session.draft.script.characters[idx]?.name;
+  const pendingPhoto = ctx.session.draft.pendingPhotoUrl;
+  if (!name || !pendingPhoto) {
+    await ctx.reply("Что-то пошло не так, пришли фото ещё раз.");
+    return;
+  }
+
+  ctx.session.draft.characters.push({ name, source: "user_upload", ref_image_url: pendingPhoto });
+
+  const remaining = ctx.session.draft.script.characters
+    .map((c) => c.name)
+    .filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
+
+  if (remaining.length > 0) {
+    await ctx.reply(
+      `Добавлен персонаж "${name}". Осталось: ${remaining.join(", ")}.\n` +
+      `Пришли следующее фото, или /done если персонажей больше нет (недостающие будут сгенерированы ИИ).`
+    );
+  } else {
+    await ctx.reply(`Все персонажи собраны. Можно жать /done.`);
+  }
 });
 
 // ---------- Завершение сбора персонажей ----------
@@ -276,6 +362,7 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
       title: ctx.session.draft.script.title,
       script: ctx.session.draft.script,
       characters: ctx.session.draft.characters,
+      locations: ctx.session.draft.locations || [],
       status: "processing",
     })
     .select()
@@ -332,6 +419,7 @@ async function processEpisode(ctx, episode) {
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
 
   let voiceoverQuotaWarned = false;
+  let compositeWarned = false;
 
   try {
     for (let i = 0; i < scenes.length; i++) {
@@ -365,169 +453,41 @@ async function processEpisode(ctx, episode) {
       // не тратим WaveSpeed-квоту повторно на то, что уже сгенерировалось нормально.
       const location = locationByName.get(scene.location);
       let referenceImageUrl = existing?.character_ref_image_url || primaryCharacter.ref_image_url;
+      let usedLocationComposite = !!existing?.character_ref_image_url;
       if (!existing?.character_ref_image_url && location?.image_url) {
-        try {
-          const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
-          referenceImageUrl = await generateSceneReferenceImage(
-            location.image_url,
-            allCharacterUrls,
-            scene.character_position || "standing naturally in the scene"
-          );
-        } catch (err) {
-          console.log(
-            `Композитный кадр недоступен (${err.message?.slice(0, 100)}), использую фото персонажа напрямую`
-          );
-        }
-      }
-
-      // Аналогично — если озвучка уже была сгенерирована в прошлый раз, не бьём
-      // по TTS-квоте ещё раз. Если квота исчерпана — сцена идёт без звука, но
-      // эпизод продолжает собираться, а не падает целиком.
-      let voiceoverUrl = existing?.voiceover_audio_url ?? null;
-      if (!voiceoverUrl && scene.voiceover_text) {
-        try {
-          voiceoverUrl = await generateVoiceover(scene.voiceover_text, scene.voice_style);
-        } catch (err) {
-          if (!voiceoverQuotaWarned) {
-            voiceoverQuotaWarned = true;
-            await ctx
-              .reply("Озвучка временно недоступна (лимит запросов Gemini TTS исчерпан) — эпизод соберётся без неё.")
-              .catch(() => {});
+        const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
+        // Композитный кадр слишком важен для консистентности фона, чтобы сдаваться
+        // после первой же заминки — даём вторую попытку перед откатом на портрет.
+        for (let attempt = 0; attempt < 2 && !usedLocationComposite; attempt++) {
+          try {
+            referenceImageUrl = await generateSceneReferenceImage(
+              location.image_url,
+              allCharacterUrls,
+              scene.character_position || "standing naturally in the scene"
+            );
+            usedLocationComposite = true;
+          } catch (err) {
+            console.log(
+              `Композитный кадр для сцены ${sceneNumber} не удался (попытка ${attempt + 1}/2): ${err.message?.slice(0, 150)}`
+            );
           }
-          console.log(`Озвучка недоступна для сцены ${sceneNumber} (${err.message?.slice(0, 150)}), продолжаю без звука`);
+        }
+        if (!usedLocationComposite && !compositeWarned) {
+          compositeWarned = true;
+          await ctx
+            .reply(
+              "Не получилось встроить персонажа в фон локации для одной из сцен — использую портрет персонажа " +
+              "и текстовое описание места вместо готовой картинки фона."
+            )
+            .catch(() => {});
         }
       }
 
-      const job = await generateVideoScene({
-        referenceImageUrl,
-        prompt: scene.script_text,
-        durationSec: scene.duration_sec,
-      });
+      // Если составной кадр с фоном не удался — подстраховываемся текстом в промте
+      // видео-генератора, чтобы модель хотя бы знала, что это за место, а не
+      // рисовала пустой фон вокруг портрета персонажа.
+      const videoPrompt = usedLocationComposite || !location
+        ? scene.script_text
+        : `${scene.script_text} Location: ${location.description}`;
 
-      const row = {
-        episode_id: episode.id,
-        scene_number: sceneNumber,
-        script_text: scene.script_text,
-        character_ref_image_url: referenceImageUrl,
-        video_job_id: job.job_id,
-        video_status: "processing",
-        voiceover_audio_url: voiceoverUrl,
-        duration_sec: scene.duration_sec,
-      };
-
-      if (existing) {
-        await supabase.from("scenes").update(row).eq("id", existing.id);
-      } else {
-        await supabase.from("scenes").insert(row);
-      }
-    }
-  } catch (err) {
-    console.error("Ошибка при подготовке сцен эпизода:", err);
-    await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply(
-      "Не получилось подготовить часть сцен эпизода. Уже готовые и отправленные сцены сохранены — " +
-      "продолжи командой /replay, она не будет пересоздавать сценарий, персонажей и то, что уже сделано."
-    );
-    return;
-  }
-
-  await ctx.reply("Все сцены отправлены на генерацию. Проверяю статус...");
-
-  pollScenes(ctx, episode.id);
-}
-
-// ---------- Поллинг статуса генерации ----------
-async function pollScenes(ctx, episodeId, attempt = 0) {
-  const { data: scenes } = await supabase
-    .from("scenes")
-    .select("*")
-    .eq("episode_id", episodeId)
-    .order("scene_number");
-
-  const pending = scenes.filter((s) => s.video_status === "processing");
-
-  for (const scene of pending) {
-    const status = await checkVideoStatus(scene.video_job_id);
-    if (status.done) {
-      await supabase
-        .from("scenes")
-        .update({ video_status: "done", video_url: status.video_url })
-        .eq("id", scene.id);
-    } else if (status.error) {
-      await supabase.from("scenes").update({ video_status: "error" }).eq("id", scene.id);
-    }
-  }
-
-  const { data: refreshed } = await supabase
-    .from("scenes")
-    .select("*")
-    .eq("episode_id", episodeId)
-    .order("scene_number");
-
-  const allDone = refreshed.every((s) => s.video_status === "done");
-  const anyError = refreshed.some((s) => s.video_status === "error");
-
-  if (allDone) {
-    await ctx.reply("Все сцены готовы, собираю финальное видео...");
-    try {
-      const finalPath = await assembleEpisode(refreshed);
-      await ctx.replyWithVideo(new InputFile(finalPath));
-      await supabase.from("episodes").update({ status: "done" }).eq("id", episodeId);
-    } catch (err) {
-      console.error("Ошибка при сборке финального видео:", err);
-      await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
-      await ctx.reply(
-        "Все сцены сгенерировались, но не получилось склеить финальное видео (ошибка ffmpeg). " +
-        "Данные сцен сохранены, можно попробовать пересобрать вручную."
-      );
-    }
-  } else if (anyError) {
-    await ctx.reply("Одна из сцен не сгенерировалась. Проверь /episode_status позже.");
-  } else if (attempt < 40) {
-    setTimeout(() => pollScenes(ctx, episodeId, attempt + 1), 15000);
-  } else {
-    await ctx.reply("Генерация занимает необычно долго, проверь позже через /episode_status.");
-  }
-}
-
-function formatScriptPreview(script) {
-  return script.scenes
-    .map((s, i) => `Сцена ${i + 1} (${s.duration_sec}с): ${s.script_text}`)
-    .join("\n");
-}
-
-await ensureBucket();
-
-// ---------- Webhook вместо long polling ----------
-// На бесплатном Render процесс "усыпляется" без входящего HTTP-трафика,
-// а long polling (bot.start()) для Render не годится — нужен веб-сервер,
-// который Telegram будит входящими запросами.
-const app = express();
-app.use(express.json());
-app.get("/", (req, res) => res.send("Bot is running"));
-// timeoutMilliseconds увеличен, потому что генерация сценария/фото через Gemini
-// иногда занимает дольше стандартных 10 секунд — с дефолтом grammy обрывал обработку.
-app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
-
-// Страховка: если где-то всё же вылетит необработанный reject (например, реальный
-// сетевой сбой), процесс не должен падать целиком и валить весь бот для всех пользователей.
-bot.catch((err) => {
-  console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
-  err.ctx.reply("Произошла ошибка при обработке. Попробуй ещё раз или начни заново с /new_episode.").catch(() => {});
-});
-
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled rejection (процесс продолжает работать):", err);
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`Server listening on port ${PORT}`);
-  const publicUrl = process.env.RENDER_EXTERNAL_URL;
-  if (publicUrl) {
-    await bot.api.setWebhook(publicUrl);
-    console.log("Webhook set to", publicUrl);
-  } else {
-    console.log("RENDER_EXTERNAL_URL не задан — webhook не установлен автоматически");
-  }
-});
+      // Аналогично — если озвучка уже была сге
