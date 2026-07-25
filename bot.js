@@ -1,4 +1,4 @@
-import { Bot, session, InlineKeyboard, webhookCallback } from "grammy";
+import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import express from "express";
 import "dotenv/config";
 import { supabase } from "./lib/supabase.js";
@@ -471,7 +471,7 @@ async function pollScenes(ctx, episodeId, attempt = 0) {
     await ctx.reply("Все сцены готовы, собираю финальное видео...");
     try {
       const finalPath = await assembleEpisode(refreshed);
-      await ctx.replyWithVideo({ source: finalPath });
+      await ctx.replyWithVideo(new InputFile(finalPath));
       await supabase.from("episodes").update({ status: "done" }).eq("id", episodeId);
     } catch (err) {
       console.error("Ошибка при сборке финального видео:", err);
