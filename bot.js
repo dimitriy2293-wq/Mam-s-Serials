@@ -2,13 +2,16 @@ import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy
 import express from "express";
 import "dotenv/config";
 import { supabase } from "./lib/supabase.js";
-import { generateScript, generateVoiceover } from "./lib/gemini.js";
+import { generateScript } from "./lib/gemini.js";
 import {
   generateCharacterImages,
   generateSceneReferenceImage,
   generateLocationImage,
   generateVideoScene,
+  generateVoiceover,
   checkVideoStatus,
+  checkBalance,
+  estimateEpisodeCostUsd,
 } from "./lib/wavespeed.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
@@ -332,17 +335,41 @@ async function confirmAndEstimateCredits(ctx) {
   try {
     const scenes = ctx.session.draft.script.scenes;
     const totalSeconds = scenes.reduce((s, sc) => s + sc.duration_sec, 0);
-    // Ориентировочно: Wan 2.2 image-to-video ~$0.01/сек, Nano Banana 2 (edit/composite кадра) ~$0.07/картинку
-    const videoCost = totalSeconds * 0.01;
-    const imageCost = scenes.length * 0.07;
-    const estimatedCost = (videoCost + imageCost).toFixed(2);
+    const locationsNeedingGen = (ctx.session.draft.locations || []).filter((l) => !l.image_url).length;
+    const voiceoverSceneCount = scenes.filter((s) => s.voiceover_text).length;
+
+    const estimatedCost = estimateEpisodeCostUsd({
+      sceneCount: scenes.length,
+      locationCount: locationsNeedingGen,
+      voiceoverSceneCount,
+    });
+
+    // Проверяем реальный баланс на WaveSpeed ДО старта, а не узнаём о его нехватке
+    // на середине генерации, когда часть денег уже потрачена.
+    let balance = null;
+    try {
+      balance = await checkBalance();
+    } catch (err) {
+      console.log(`Не удалось проверить баланс WaveSpeed: ${err.message?.slice(0, 150)}`);
+    }
 
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
+    let balanceLine = "";
+    if (balance !== null) {
+      balanceLine = `\nБаланс WaveSpeed: $${balance.toFixed(2)}.`;
+      if (balance < estimatedCost) {
+        balanceLine +=
+          `\n⚠️ Похоже, баланса может не хватить на весь эпизод (нужно примерно $${estimatedCost.toFixed(2)}) — ` +
+          `генерация может остановиться на середине. Можно пополнить баланс на wavespeed.ai, ` +
+          `или всё равно попробовать (тогда часть сцен потом можно будет доделать через /replay).`;
+      }
+    }
+
     await ctx.reply(
       `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
-      `Примерно $${estimatedCost} на WaveSpeed.\n\nПодтверждаешь генерацию?`,
+      `Примерно $${estimatedCost.toFixed(2)} на WaveSpeed.${balanceLine}\n\nПодтверждаешь генерацию?`,
       { reply_markup: kb }
     );
   } catch (err) {
@@ -418,7 +445,7 @@ async function processEpisode(ctx, episode) {
     .eq("episode_id", episode.id);
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
 
-  let voiceoverQuotaWarned = false;
+  let voiceoverFailWarned = false;
   let compositeWarned = false;
 
   try {
@@ -490,18 +517,28 @@ async function processEpisode(ctx, episode) {
         ? scene.script_text
         : `${scene.script_text} Location: ${location.description}`;
 
-      // Аналогично — если озвучка уже была сгенерирована в прошлый раз, не бьём
-      // по TTS-квоте ещё раз. Если квота исчерпана — сцена идёт без звука, но
-      // эпизод продолжает собираться, а не падает целиком.
+      // Если озвучка уже была сгенерирована в прошлый раз (/replay) — не тратим
+      // деньги на неё повторно. Голос закреплён за конкретным персонажем
+      // (по имени говорящего в сцене), поэтому у каждого персонажа свой голос,
+      // а не один общий на весь эпизод.
       let voiceoverUrl = existing?.voiceover_audio_url ?? null;
       if (!voiceoverUrl && scene.voiceover_text) {
+        const speakerName = scene.primary_character;
+        const speakerDescription =
+          episode.script.characters.find((c) => normalizeName(c.name) === normalizeName(speakerName))
+            ?.description || "";
         try {
-          voiceoverUrl = await generateVoiceover(scene.voiceover_text, scene.voice_style);
+          voiceoverUrl = await generateVoiceover(
+            scene.voiceover_text,
+            speakerName,
+            speakerDescription,
+            scene.voice_style
+          );
         } catch (err) {
-          if (!voiceoverQuotaWarned) {
-            voiceoverQuotaWarned = true;
+          if (!voiceoverFailWarned) {
+            voiceoverFailWarned = true;
             await ctx
-              .reply("Озвучка временно недоступна (лимит запросов Gemini TTS исчерпан) — эпизод соберётся без неё.")
+              .reply("Озвучка не получилась для одной из сцен (ошибка WaveSpeed) — эпизод соберётся без неё.")
               .catch(() => {});
           }
           console.log(`Озвучка недоступна для сцены ${sceneNumber} (${err.message?.slice(0, 150)}), продолжаю без звука`);
