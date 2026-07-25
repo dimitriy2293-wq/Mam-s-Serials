@@ -177,18 +177,23 @@ bot.command("done", async (ctx) => {
 
 // ---------- Подтверждение перед тратой кредитов ----------
 async function confirmAndEstimateCredits(ctx) {
-  const scenes = ctx.session.draft.script.scenes;
-  const totalSeconds = scenes.reduce((s, sc) => s + sc.duration_sec, 0);
-  const estimatedCredits = totalSeconds * 24; // Wan 2.2: 24 кредита/сек
+  try {
+    const scenes = ctx.session.draft.script.scenes;
+    const totalSeconds = scenes.reduce((s, sc) => s + sc.duration_sec, 0);
+    const estimatedCredits = totalSeconds * 24; // Wan 2.2: 24 кредита/сек
 
-  ctx.session.step = "awaiting_generation_confirm";
-  const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
+    ctx.session.step = "awaiting_generation_confirm";
+    const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
-  await ctx.reply(
-    `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
-    `Примерно ${estimatedCredits} кредитов Magic Hour.\n\nПодтверждаешь генерацию?`,
-    { reply_markup: kb }
-  );
+    await ctx.reply(
+      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
+      `Примерно ${estimatedCredits} кредитов Magic Hour.\n\nПодтверждаешь генерацию?`,
+      { reply_markup: kb }
+    );
+  } catch (err) {
+    console.error("Ошибка в confirmAndEstimateCredits:", err);
+    await ctx.reply("Что-то пошло не так при подсчёте кредитов. Попробуй /new_episode заново.");
+  }
 }
 
 bot.callbackQuery("confirm_generate", async (ctx) => {
@@ -332,6 +337,11 @@ app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
 
 // Страховка: если где-то всё же вылетит необработанный reject (например, реальный
 // сетевой сбой), процесс не должен падать целиком и валить весь бот для всех пользователей.
+bot.catch((err) => {
+  console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
+  err.ctx.reply("Произошла ошибка при обработке. Попробуй ещё раз или начни заново с /new_episode.").catch(() => {});
+});
+
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection (процесс продолжает работать):", err);
 });
