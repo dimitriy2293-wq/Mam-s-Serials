@@ -2,13 +2,13 @@ import { Bot, session, InlineKeyboard, webhookCallback } from "grammy";
 import express from "express";
 import "dotenv/config";
 import { supabase } from "./lib/supabase.js";
+import { generateScript, generateVoiceover } from "./lib/gemini.js";
 import {
-  generateScript,
   generateCharacterImages,
   generateSceneReferenceImage,
-  generateVoiceover,
-} from "./lib/gemini.js";
-import { generateVideoScene, checkVideoStatus } from "./lib/magichour.js";
+  generateVideoScene,
+  checkVideoStatus,
+} from "./lib/wavespeed.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
@@ -138,7 +138,10 @@ bot.callbackQuery("chars_ai", async (ctx) => {
     await confirmAndEstimateCredits(ctx);
   } catch (err) {
     console.error("Ошибка генерации персонажей:", err);
-    await ctx.reply("Не получилось сгенерировать персонажей — Gemini не ответил. Попробуй нажать ещё раз через минуту.");
+    await ctx.reply(
+      "Не получилось сгенерировать персонажей через ИИ — WaveSpeed не ответил (возможно, кончились кредиты). " +
+      "Пришли свои фото персонажей вместо этого: набери /new_episode заново и выбери 'Свои персонажи'."
+    );
   }
 });
 
@@ -173,7 +176,10 @@ bot.command("done", async (ctx) => {
       ctx.session.draft.characters.push(...generated);
     } catch (err) {
       console.error("Ошибка генерации недостающих персонажей:", err);
-      await ctx.reply("Gemini не ответил при генерации персонажей. Попробуй /done ещё раз через минуту.");
+      await ctx.reply(
+        "WaveSpeed не ответил при генерации персонажей (возможно, кончились кредиты). " +
+        "Пришли фото для оставшихся персонажей вручную вместо ИИ-генерации."
+      );
       return;
     }
   }
@@ -181,19 +187,22 @@ bot.command("done", async (ctx) => {
   await confirmAndEstimateCredits(ctx);
 });
 
-// ---------- Подтверждение перед тратой кредитов ----------
+// ---------- Подтверждение перед тратой $ ----------
 async function confirmAndEstimateCredits(ctx) {
   try {
     const scenes = ctx.session.draft.script.scenes;
     const totalSeconds = scenes.reduce((s, sc) => s + sc.duration_sec, 0);
-    const estimatedCredits = totalSeconds * 24; // Wan 2.2: 24 кредита/сек
+    // Ориентировочно: Wan 2.2 image-to-video ~$0.01/сек, Nano Banana 2 (edit/composite кадра) ~$0.07/картинку
+    const videoCost = totalSeconds * 0.01;
+    const imageCost = scenes.length * 0.07;
+    const estimatedCost = (videoCost + imageCost).toFixed(2);
 
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
     await ctx.reply(
       `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
-      `Примерно ${estimatedCredits} кредитов Magic Hour.\n\nПодтверждаешь генерацию?`,
+      `Примерно $${estimatedCost} на WaveSpeed.\n\nПодтверждаешь генерацию?`,
       { reply_markup: kb }
     );
   } catch (err) {
@@ -237,11 +246,19 @@ async function processEpisode(ctx, episode) {
         .map((name) => characters.find((c) => c.name === name))
         .filter(Boolean);
 
-      // Для КАЖДОЙ сцены (не только многоперсонажной) сначала собираем полный кадр:
-      // персонаж(и) из их референс-фото + фон/декорация по описанию сцены из сценария.
-      // Именно этот собранный кадр — единственный референс, который дальше идёт в Wan 2.2.
-      const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
-      const referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
+      // Пробуем собрать полный кадр сцены через WaveSpeed (персонаж(и) + фон под описание).
+      // Если у аккаунта нет бесплатной квоты на генерацию изображений (частый случай
+      // на free tier без включённого биллинга) — используем фото персонажа напрямую,
+      // а фон/декорация всё равно попадут в кадр через текстовый промпт для Wan 2.2.
+      let referenceImageUrl = primaryCharacter.ref_image_url;
+      try {
+        const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
+        referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
+      } catch (err) {
+        console.log(
+          `Композитный кадр недоступен (${err.message?.slice(0, 100)}), использую фото персонажа напрямую`
+        );
+      }
 
       const voiceoverUrl = scene.voiceover_text
         ? await generateVoiceover(scene.voiceover_text, scene.voice_style)
@@ -267,7 +284,7 @@ async function processEpisode(ctx, episode) {
   } catch (err) {
     console.error("Ошибка при подготовке сцен эпизода:", err);
     await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply("Не получилось подготовить сцены — один из сервисов (Gemini или Magic Hour) не ответил. Попробуй /new_episode заново через минуту.");
+    await ctx.reply("Не получилось подготовить сцены — WaveSpeed не ответил. Попробуй /new_episode заново через минуту.");
     return;
   }
 
