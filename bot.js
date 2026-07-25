@@ -54,7 +54,13 @@ bot.callbackQuery("draft_no", async (ctx) => {
 });
 
 // ---------- Текстовые сообщения (роутинг по шагам) ----------
-bot.on("message:text", async (ctx) => {
+bot.on("message:text", async (ctx, next) => {
+  // Команды (/done, /start и т.д.) — это тоже текстовые сообщения, но их должны
+  // обрабатывать соответствующие bot.command(...), а не этот общий текстовый хендлер.
+  // Без этой проверки, например, /done "проглатывался" здесь и не долетал до
+  // bot.command("done"), потому что этот обработчик зарегистрирован раньше в коде.
+  if (ctx.message.text.startsWith("/")) return next();
+
   const step = ctx.session.step;
 
   if (step === "awaiting_draft_text" || step === "awaiting_theme") {
