@@ -11,11 +11,14 @@ import {
 import { generateVideoScene, checkVideoStatus } from "./lib/magichour.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
+import { supabaseSessionStorage } from "./lib/session-storage.js";
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
 bot.use(session({
   initial: () => ({ step: null, draft: {} }),
+  storage: supabaseSessionStorage,
+  getSessionKey: (ctx) => ctx.from?.id.toString(),
 }));
 
 // ---------- /start ----------
@@ -148,7 +151,10 @@ bot.on("message:photo", async (ctx) => {
 
 // ---------- Завершение сбора персонажей ----------
 bot.command("done", async (ctx) => {
-  if (ctx.session.step !== "awaiting_character_photos") return;
+  if (ctx.session.step !== "awaiting_character_photos") {
+    await ctx.reply("Похоже, сессия сброшена или мы не на этом шаге. Начни заново: /new_episode");
+    return;
+  }
 
   const scriptCharacters = ctx.session.draft.script.characters;
   const haveNames = ctx.session.draft.characters.map((c) => c.name);
