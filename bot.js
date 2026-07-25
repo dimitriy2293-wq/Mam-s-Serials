@@ -58,7 +58,15 @@ bot.on("message:text", async (ctx) => {
     const isDraft = step === "awaiting_draft_text";
     await ctx.reply("Дорабатываю сценарий...");
 
-    const script = await generateScript({ userInput: ctx.message.text, isDraft });
+    let script;
+    try {
+      script = await generateScript({ userInput: ctx.message.text, isDraft });
+    } catch (err) {
+      console.error("Ошибка генерации сценария:", err);
+      await ctx.reply("Gemini сейчас перегружен и не ответил после нескольких попыток. Попробуй ещё раз через минуту — просто пришли текст заново.");
+      return;
+    }
+
     ctx.session.draft.script = script;
     ctx.session.step = "awaiting_character_choice";
 
@@ -115,9 +123,14 @@ bot.callbackQuery("chars_own", async (ctx) => {
 bot.callbackQuery("chars_ai", async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.reply("Генерирую всех персонажей по описанию из сценария...");
-  const characters = await generateCharacterImages(ctx.session.draft.script.characters);
-  ctx.session.draft.characters = characters;
-  await confirmAndEstimateCredits(ctx);
+  try {
+    const characters = await generateCharacterImages(ctx.session.draft.script.characters);
+    ctx.session.draft.characters = characters;
+    await confirmAndEstimateCredits(ctx);
+  } catch (err) {
+    console.error("Ошибка генерации персонажей:", err);
+    await ctx.reply("Не получилось сгенерировать персонажей — Gemini не ответил. Попробуй нажать ещё раз через минуту.");
+  }
 });
 
 // ---------- Приём фото персонажей (несколько, по одному за раз) ----------
@@ -143,8 +156,14 @@ bot.command("done", async (ctx) => {
 
   if (missing.length > 0) {
     await ctx.reply(`Генерирую недостающих персонажей (${missing.map((c) => c.name).join(", ")}) через ИИ...`);
-    const generated = await generateCharacterImages(missing);
-    ctx.session.draft.characters.push(...generated);
+    try {
+      const generated = await generateCharacterImages(missing);
+      ctx.session.draft.characters.push(...generated);
+    } catch (err) {
+      console.error("Ошибка генерации недостающих персонажей:", err);
+      await ctx.reply("Gemini не ответил при генерации персонажей. Попробуй /done ещё раз через минуту.");
+      return;
+    }
   }
 
   await confirmAndEstimateCredits(ctx);
@@ -191,41 +210,48 @@ async function processEpisode(ctx, episode) {
   const characters = episode.characters; // [{name, ref_image_url, source}]
   const sceneRows = [];
 
-  for (let i = 0; i < scenes.length; i++) {
-    const scene = scenes[i];
+  try {
+    for (let i = 0; i < scenes.length; i++) {
+      const scene = scenes[i];
 
-    const primaryCharacter =
-      characters.find((c) => c.name === scene.primary_character) || characters[0];
-    const secondaryCharacters = (scene.secondary_characters || [])
-      .map((name) => characters.find((c) => c.name === name))
-      .filter(Boolean);
+      const primaryCharacter =
+        characters.find((c) => c.name === scene.primary_character) || characters[0];
+      const secondaryCharacters = (scene.secondary_characters || [])
+        .map((name) => characters.find((c) => c.name === name))
+        .filter(Boolean);
 
-    // Для КАЖДОЙ сцены (не только многоперсонажной) сначала собираем полный кадр:
-    // персонаж(и) из их референс-фото + фон/декорация по описанию сцены из сценария.
-    // Именно этот собранный кадр — единственный референс, который дальше идёт в Wan 2.2.
-    const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
-    const referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
+      // Для КАЖДОЙ сцены (не только многоперсонажной) сначала собираем полный кадр:
+      // персонаж(и) из их референс-фото + фон/декорация по описанию сцены из сценария.
+      // Именно этот собранный кадр — единственный референс, который дальше идёт в Wan 2.2.
+      const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
+      const referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
 
-    const voiceoverUrl = scene.voiceover_text
-      ? await generateVoiceover(scene.voiceover_text, scene.voice_style)
-      : null;
+      const voiceoverUrl = scene.voiceover_text
+        ? await generateVoiceover(scene.voiceover_text, scene.voice_style)
+        : null;
 
-    const job = await generateVideoScene({
-      referenceImageUrl,
-      prompt: scene.script_text,
-      durationSec: scene.duration_sec,
-    });
+      const job = await generateVideoScene({
+        referenceImageUrl,
+        prompt: scene.script_text,
+        durationSec: scene.duration_sec,
+      });
 
-    sceneRows.push({
-      episode_id: episode.id,
-      scene_number: i + 1,
-      script_text: scene.script_text,
-      character_ref_image_url: referenceImageUrl,
-      video_job_id: job.job_id,
-      video_status: "processing",
-      voiceover_audio_url: voiceoverUrl,
-      duration_sec: scene.duration_sec,
-    });
+      sceneRows.push({
+        episode_id: episode.id,
+        scene_number: i + 1,
+        script_text: scene.script_text,
+        character_ref_image_url: referenceImageUrl,
+        video_job_id: job.job_id,
+        video_status: "processing",
+        voiceover_audio_url: voiceoverUrl,
+        duration_sec: scene.duration_sec,
+      });
+    }
+  } catch (err) {
+    console.error("Ошибка при подготовке сцен эпизода:", err);
+    await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
+    await ctx.reply("Не получилось подготовить сцены — один из сервисов (Gemini или Magic Hour) не ответил. Попробуй /new_episode заново через минуту.");
+    return;
   }
 
   await supabase.from("scenes").insert(sceneRows);
