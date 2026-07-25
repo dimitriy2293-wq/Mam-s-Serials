@@ -1,4 +1,5 @@
-import { Bot, session, InlineKeyboard } from "grammy";
+import { Bot, session, InlineKeyboard, webhookCallback } from "grammy";
+import express from "express";
 import "dotenv/config";
 import { supabase } from "./lib/supabase.js";
 import {
@@ -285,5 +286,24 @@ function formatScriptPreview(script) {
 }
 
 await ensureBucket();
-bot.start();
-console.log("Bot started");
+
+// ---------- Webhook вместо long polling ----------
+// На бесплатном Render процесс "усыпляется" без входящего HTTP-трафика,
+// а long polling (bot.start()) для Render не годится — нужен веб-сервер,
+// который Telegram будит входящими запросами.
+const app = express();
+app.use(express.json());
+app.get("/", (req, res) => res.send("Bot is running"));
+app.use(webhookCallback(bot, "express"));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  const publicUrl = process.env.RENDER_EXTERNAL_URL;
+  if (publicUrl) {
+    await bot.api.setWebhook(publicUrl);
+    console.log("Webhook set to", publicUrl);
+  } else {
+    console.log("RENDER_EXTERNAL_URL не задан — webhook не установлен автоматически");
+  }
+});
