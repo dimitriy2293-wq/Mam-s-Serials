@@ -6,6 +6,7 @@ import { generateScript, generateVoiceover } from "./lib/gemini.js";
 import {
   generateCharacterImages,
   generateSceneReferenceImage,
+  generateLocationImage,
   generateVideoScene,
   checkVideoStatus,
 } from "./lib/wavespeed.js";
@@ -43,8 +44,43 @@ bot.use(session({
 bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету.\n\n" +
-    "Нажми /new_episode чтобы начать новый эпизод."
+    "Нажми /new_episode чтобы начать новый эпизод.\n" +
+    "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось, " +
+    "не переделывая сценарий и персонажей."
   );
+});
+
+// ---------- /replay: продолжить последний упавший эпизод, не переделывая сценарий/персонажей ----------
+bot.command("replay", async (ctx) => {
+  const { data: episode, error } = await supabase
+    .from("episodes")
+    .select("*")
+    .eq("telegram_id", ctx.from.id)
+    .eq("status", "error")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Ошибка при поиске эпизода для /replay:", error);
+    await ctx.reply("Не получилось найти эпизод для повтора. Попробуй ещё раз.");
+    return;
+  }
+  if (!episode) {
+    await ctx.reply("Не нашёл эпизодов с ошибкой для повтора — либо всё готово, либо ещё генерируется.");
+    return;
+  }
+
+  await ctx.reply(
+    `Продолжаю эпизод «${episode.title}» — сценарий, персонажи и уже готовые сцены не трогаю, ` +
+    `доделываю только то, что не успело сгенерироваться.`
+  );
+  await supabase.from("episodes").update({ status: "processing" }).eq("id", episode.id);
+
+  processEpisode(ctx, episode).catch((err) => {
+    console.error("Необработанная ошибка в processEpisode (replay):", err);
+    ctx.reply("Опять что-то пошло не так. Можешь попробовать /replay ещё раз.").catch(() => {});
+  });
 });
 
 // ---------- /new_episode ----------
@@ -259,14 +295,54 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
 });
 
 // ---------- Обработка эпизода: генерация сцен + сборка ----------
+// Резюмируемая: episode.script и episode.characters уже лежат в БД (сохранены
+// до вызова этой функции), поэтому при повторном вызове (через /replay после
+// ошибки) сценарий и персонажи НЕ перегенерируются. Уже отправленные на
+// генерацию или готовые сцены (video_status processing/done) тоже пропускаются —
+// каждая сцена пишется в БД сразу после подготовки, а не пачкой в конце, поэтому
+// частичный прогресс не теряется при падении на середине.
 async function processEpisode(ctx, episode) {
   const scenes = episode.script.scenes;
   const characters = episode.characters; // [{name, ref_image_url, source}]
-  const sceneRows = [];
+
+  // Фон каждой локации генерируется один раз и переиспользуется во всех её сценах
+  // (и при /replay — тоже переиспользуется, а не генерируется заново).
+  const locations = episode.locations && episode.locations.length > 0
+    ? episode.locations
+    : (episode.script.locations || []).map((l) => ({ ...l, image_url: null }));
+
+  const missingLocations = locations.filter((l) => !l.image_url);
+  if (missingLocations.length > 0) {
+    await ctx.reply(`Готовлю фон для локаций (${missingLocations.map((l) => l.name).join(", ")})...`);
+    for (const loc of missingLocations) {
+      try {
+        loc.image_url = await generateLocationImage(loc.description);
+      } catch (err) {
+        console.log(`Не удалось сгенерировать фон локации "${loc.name}" (${err.message?.slice(0, 100)}), сцены в ней пойдут без фиксированного фона`);
+      }
+    }
+    await supabase.from("episodes").update({ locations }).eq("id", episode.id);
+  }
+  const locationByName = new Map(locations.map((l) => [l.name, l]));
+
+  const { data: existingScenes } = await supabase
+    .from("scenes")
+    .select("*")
+    .eq("episode_id", episode.id);
+  const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
+
+  let voiceoverQuotaWarned = false;
 
   try {
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
+      const sceneNumber = i + 1;
+      const existing = existingByNumber.get(sceneNumber);
+
+      // Сцена уже отправлена на генерацию видео или готова — не трогаем её.
+      if (existing && (existing.video_status === "processing" || existing.video_status === "done")) {
+        continue;
+      }
 
       // Раньше при отсутствии совпадения по имени тихо подставлялся characters[0] —
       // из-за этого сцена могла молча получить лицо совсем другого персонажа.
@@ -285,18 +361,18 @@ async function processEpisode(ctx, episode) {
         .map((name) => characters.find((c) => normalizeName(c.name) === normalizeName(name)))
         .filter(Boolean);
 
-      // Композитный кадр (несколько персонажей в одной сцене) нужен, только когда
-      // в сцене реально больше одного персонажа. Раньше он вызывался для КАЖДОЙ
-      // сцены, включая те, где есть только один персонаж с уже присланным реальным
-      // фото, — Nano Banana при этом пересоздавала лицо заново (искажая сходство)
-      // и иногда добавляла в кадр случайного "лишнего" человека, а заодно лишний раз
-      // жгла квоту WaveSpeed, приближая рейт-лимит. Для одиночных сцен просто
-      // используем присланное/сгенерированное фото персонажа как есть.
-      let referenceImageUrl = primaryCharacter.ref_image_url;
-      if (secondaryCharacters.length > 0) {
+      // При повторе (/replay) уже подготовленный референс-кадр сцены переиспользуем —
+      // не тратим WaveSpeed-квоту повторно на то, что уже сгенерировалось нормально.
+      const location = locationByName.get(scene.location);
+      let referenceImageUrl = existing?.character_ref_image_url || primaryCharacter.ref_image_url;
+      if (!existing?.character_ref_image_url && location?.image_url) {
         try {
           const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
-          referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
+          referenceImageUrl = await generateSceneReferenceImage(
+            location.image_url,
+            allCharacterUrls,
+            scene.character_position || "standing naturally in the scene"
+          );
         } catch (err) {
           console.log(
             `Композитный кадр недоступен (${err.message?.slice(0, 100)}), использую фото персонажа напрямую`
@@ -304,9 +380,23 @@ async function processEpisode(ctx, episode) {
         }
       }
 
-      const voiceoverUrl = scene.voiceover_text
-        ? await generateVoiceover(scene.voiceover_text, scene.voice_style)
-        : null;
+      // Аналогично — если озвучка уже была сгенерирована в прошлый раз, не бьём
+      // по TTS-квоте ещё раз. Если квота исчерпана — сцена идёт без звука, но
+      // эпизод продолжает собираться, а не падает целиком.
+      let voiceoverUrl = existing?.voiceover_audio_url ?? null;
+      if (!voiceoverUrl && scene.voiceover_text) {
+        try {
+          voiceoverUrl = await generateVoiceover(scene.voiceover_text, scene.voice_style);
+        } catch (err) {
+          if (!voiceoverQuotaWarned) {
+            voiceoverQuotaWarned = true;
+            await ctx
+              .reply("Озвучка временно недоступна (лимит запросов Gemini TTS исчерпан) — эпизод соберётся без неё.")
+              .catch(() => {});
+          }
+          console.log(`Озвучка недоступна для сцены ${sceneNumber} (${err.message?.slice(0, 150)}), продолжаю без звука`);
+        }
+      }
 
       const job = await generateVideoScene({
         referenceImageUrl,
@@ -314,25 +404,33 @@ async function processEpisode(ctx, episode) {
         durationSec: scene.duration_sec,
       });
 
-      sceneRows.push({
+      const row = {
         episode_id: episode.id,
-        scene_number: i + 1,
+        scene_number: sceneNumber,
         script_text: scene.script_text,
         character_ref_image_url: referenceImageUrl,
         video_job_id: job.job_id,
         video_status: "processing",
         voiceover_audio_url: voiceoverUrl,
         duration_sec: scene.duration_sec,
-      });
+      };
+
+      if (existing) {
+        await supabase.from("scenes").update(row).eq("id", existing.id);
+      } else {
+        await supabase.from("scenes").insert(row);
+      }
     }
   } catch (err) {
     console.error("Ошибка при подготовке сцен эпизода:", err);
     await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply("Не получилось подготовить сцены — WaveSpeed не ответил. Попробуй /new_episode заново через минуту.");
+    await ctx.reply(
+      "Не получилось подготовить часть сцен эпизода. Уже готовые и отправленные сцены сохранены — " +
+      "продолжи командой /replay, она не будет пересоздавать сценарий, персонажей и то, что уже сделано."
+    );
     return;
   }
 
-  await supabase.from("scenes").insert(sceneRows);
   await ctx.reply("Все сцены отправлены на генерацию. Проверяю статус...");
 
   pollScenes(ctx, episode.id);
@@ -433,4 +531,3 @@ app.listen(PORT, async () => {
     console.log("RENDER_EXTERNAL_URL не задан — webhook не установлен автоматически");
   }
 });
-
