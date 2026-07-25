@@ -490,4 +490,154 @@ async function processEpisode(ctx, episode) {
         ? scene.script_text
         : `${scene.script_text} Location: ${location.description}`;
 
-      // Аналогично — если озвучка уже была сге
+      // Аналогично — если озвучка уже была сгенерирована в прошлый раз, не бьём
+      // по TTS-квоте ещё раз. Если квота исчерпана — сцена идёт без звука, но
+      // эпизод продолжает собираться, а не падает целиком.
+      let voiceoverUrl = existing?.voiceover_audio_url ?? null;
+      if (!voiceoverUrl && scene.voiceover_text) {
+        try {
+          voiceoverUrl = await generateVoiceover(scene.voiceover_text, scene.voice_style);
+        } catch (err) {
+          if (!voiceoverQuotaWarned) {
+            voiceoverQuotaWarned = true;
+            await ctx
+              .reply("Озвучка временно недоступна (лимит запросов Gemini TTS исчерпан) — эпизод соберётся без неё.")
+              .catch(() => {});
+          }
+          console.log(`Озвучка недоступна для сцены ${sceneNumber} (${err.message?.slice(0, 150)}), продолжаю без звука`);
+        }
+      }
+
+      const job = await generateVideoScene({
+        referenceImageUrl,
+        prompt: videoPrompt,
+        durationSec: scene.duration_sec,
+      });
+
+      const row = {
+        episode_id: episode.id,
+        scene_number: sceneNumber,
+        script_text: scene.script_text,
+        character_ref_image_url: referenceImageUrl,
+        video_job_id: job.job_id,
+        video_status: "processing",
+        voiceover_audio_url: voiceoverUrl,
+        duration_sec: scene.duration_sec,
+      };
+
+      if (existing) {
+        await supabase.from("scenes").update(row).eq("id", existing.id);
+      } else {
+        await supabase.from("scenes").insert(row);
+      }
+    }
+  } catch (err) {
+    console.error("Ошибка при подготовке сцен эпизода:", err);
+    await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
+    await ctx.reply(
+      "Не получилось подготовить часть сцен эпизода. Уже готовые и отправленные сцены сохранены — " +
+      "продолжи командой /replay, она не будет пересоздавать сценарий, персонажей и то, что уже сделано."
+    );
+    return;
+  }
+
+  await ctx.reply("Все сцены отправлены на генерацию. Проверяю статус...");
+
+  pollScenes(ctx, episode.id);
+}
+
+// ---------- Поллинг статуса генерации ----------
+async function pollScenes(ctx, episodeId, attempt = 0) {
+  const { data: scenes } = await supabase
+    .from("scenes")
+    .select("*")
+    .eq("episode_id", episodeId)
+    .order("scene_number");
+
+  const pending = scenes.filter((s) => s.video_status === "processing");
+
+  for (const scene of pending) {
+    const status = await checkVideoStatus(scene.video_job_id);
+    if (status.done) {
+      await supabase
+        .from("scenes")
+        .update({ video_status: "done", video_url: status.video_url })
+        .eq("id", scene.id);
+    } else if (status.error) {
+      await supabase.from("scenes").update({ video_status: "error" }).eq("id", scene.id);
+    }
+  }
+
+  const { data: refreshed } = await supabase
+    .from("scenes")
+    .select("*")
+    .eq("episode_id", episodeId)
+    .order("scene_number");
+
+  const allDone = refreshed.every((s) => s.video_status === "done");
+  const anyError = refreshed.some((s) => s.video_status === "error");
+
+  if (allDone) {
+    await ctx.reply("Все сцены готовы, собираю финальное видео...");
+    try {
+      const finalPath = await assembleEpisode(refreshed);
+      await ctx.replyWithVideo(new InputFile(finalPath));
+      await supabase.from("episodes").update({ status: "done" }).eq("id", episodeId);
+    } catch (err) {
+      console.error("Ошибка при сборке финального видео:", err);
+      await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
+      await ctx.reply(
+        "Все сцены сгенерировались, но не получилось склеить финальное видео (ошибка ffmpeg). " +
+        "Данные сцен сохранены, можно попробовать пересобрать вручную."
+      );
+    }
+  } else if (anyError) {
+    await ctx.reply("Одна из сцен не сгенерировалась. Проверь /episode_status позже.");
+  } else if (attempt < 40) {
+    setTimeout(() => pollScenes(ctx, episodeId, attempt + 1), 15000);
+  } else {
+    await ctx.reply("Генерация занимает необычно долго, проверь позже через /episode_status.");
+  }
+}
+
+function formatScriptPreview(script) {
+  return script.scenes
+    .map((s, i) => `Сцена ${i + 1} (${s.duration_sec}с): ${s.script_text}`)
+    .join("\n");
+}
+
+await ensureBucket();
+
+// ---------- Webhook вместо long polling ----------
+// На бесплатном Render процесс "усыпляется" без входящего HTTP-трафика,
+// а long polling (bot.start()) для Render не годится — нужен веб-сервер,
+// который Telegram будит входящими запросами.
+const app = express();
+app.use(express.json());
+app.get("/", (req, res) => res.send("Bot is running"));
+// timeoutMilliseconds увеличен, потому что генерация сценария/фото через Gemini
+// иногда занимает дольше стандартных 10 секунд — с дефолтом grammy обрывал обработку.
+app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
+
+// Страховка: если где-то всё же вылетит необработанный reject (например, реальный
+// сетевой сбой), процесс не должен падать целиком и валить весь бот для всех пользователей.
+bot.catch((err) => {
+  console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
+  err.ctx.reply("Произошла ошибка при обработке. Попробуй ещё раз или начни заново с /new_episode.").catch(() => {});
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection (процесс продолжает работать):", err);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  const publicUrl = process.env.RENDER_EXTERNAL_URL;
+  if (publicUrl) {
+    await bot.api.setWebhook(publicUrl);
+    console.log("Webhook set to", publicUrl);
+  } else {
+    console.log("RENDER_EXTERNAL_URL не задан — webhook не установлен автоматически");
+  }
+});

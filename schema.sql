@@ -4,6 +4,7 @@ create table episodes (
   title text,
   script jsonb not null,
   characters jsonb not null default '[]',
+  locations jsonb not null default '[]', -- [{ name, description, image_url }] — фиксированный фон на локацию
   status text not null default 'pending', -- pending | processing | done | error
   created_at timestamptz not null default now()
 );
