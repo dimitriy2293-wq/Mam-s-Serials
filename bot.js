@@ -15,6 +15,24 @@ import { supabaseSessionStorage } from "./lib/session-storage.js";
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
+// ---------- Безопасный answerCallbackQuery ----------
+// На бесплатном Render инстанс "засыпает" и просыпается с задержкой 50с и больше
+// (см. баннер в дашборде). Из-за этого к моменту вызова answerCallbackQuery
+// Telegram иногда уже считает callback_query устаревшим и кидает 400 "query is
+// too old". Раньше это было незапойманным throw, который обрывал обработчик
+// целиком — то есть, например, генерация эпизода в confirm_generate вообще не
+// стартовала. Оборачиваем во всех местах, чтобы это никогда не блокировало
+// остальную логику хендлера.
+async function safeAnswer(ctx) {
+  await ctx.answerCallbackQuery().catch((err) => {
+    console.log("answerCallbackQuery не прошёл (не критично):", err.message);
+  });
+}
+
+function normalizeName(name) {
+  return (name || "").trim().toLowerCase();
+}
+
 bot.use(session({
   initial: () => ({ step: null, draft: {} }),
   storage: supabaseSessionStorage,
@@ -43,13 +61,13 @@ bot.command("new_episode", async (ctx) => {
 
 bot.callbackQuery("draft_yes", async (ctx) => {
   ctx.session.step = "awaiting_draft_text";
-  await ctx.answerCallbackQuery();
+  await safeAnswer(ctx);
   await ctx.reply("Пришли текстом свою идею/черновик сюжета (можно коротко, ИИ доработает).");
 });
 
 bot.callbackQuery("draft_no", async (ctx) => {
   ctx.session.step = "awaiting_theme";
-  await ctx.answerCallbackQuery();
+  await safeAnswer(ctx);
   await ctx.reply("Опиши тему/жанр для сериала (например: 'комедия про аэропорт').");
 });
 
@@ -121,7 +139,7 @@ bot.on("message:text", async (ctx, next) => {
 bot.callbackQuery("chars_own", async (ctx) => {
   ctx.session.step = "awaiting_character_photos";
   ctx.session.draft.characters = [];
-  await ctx.answerCallbackQuery();
+  await safeAnswer(ctx);
   const names = ctx.session.draft.script.characters.map((c) => c.name).join(", ");
   await ctx.reply(
     `Пришли фото персонажа(ей) по одному (${names}). ` +
@@ -130,7 +148,7 @@ bot.callbackQuery("chars_own", async (ctx) => {
 });
 
 bot.callbackQuery("chars_ai", async (ctx) => {
-  await ctx.answerCallbackQuery();
+  await safeAnswer(ctx);
   await ctx.reply("Генерирую всех персонажей по описанию из сценария...");
   try {
     const characters = await generateCharacterImages(ctx.session.draft.script.characters);
@@ -212,7 +230,7 @@ async function confirmAndEstimateCredits(ctx) {
 }
 
 bot.callbackQuery("confirm_generate", async (ctx) => {
-  await ctx.answerCallbackQuery();
+  await safeAnswer(ctx);
   await ctx.reply("Начинаю генерацию. Это может занять несколько минут...");
 
   const { data: episode } = await supabase
@@ -227,7 +245,17 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
     .select()
     .single();
 
-  await processEpisode(ctx, episode);
+  // Намеренно НЕ ждём здесь processEpisode целиком: с троттлингом/повторами
+  // WaveSpeed генерация одного эпизода может занять несколько минут, а грамми
+  // оборачивает webhook-хендлер таймаутом в 60с. Если ждать внутри хендлера,
+  // Telegram может посчитать запрос "зависшим", а следующие апдейты от этого же
+  // пользователя будут дожидаться своей очереди и рисковать словить "query is
+  // too old". ctx.api-вызовы (ctx.reply и т.д.) работают независимо от того,
+  // завершился ли исходный webhook-запрос, так что фоновая генерация безопасна.
+  processEpisode(ctx, episode).catch((err) => {
+    console.error("Необработанная ошибка в processEpisode:", err);
+    ctx.reply("Что-то пошло не так во время генерации. Попробуй /new_episode заново.").catch(() => {});
+  });
 });
 
 // ---------- Обработка эпизода: генерация сцен + сборка ----------
@@ -240,24 +268,40 @@ async function processEpisode(ctx, episode) {
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
 
-      const primaryCharacter =
-        characters.find((c) => c.name === scene.primary_character) || characters[0];
+      // Раньше при отсутствии совпадения по имени тихо подставлялся characters[0] —
+      // из-за этого сцена могла молча получить лицо совсем другого персонажа.
+      // Теперь требуем точное совпадение (без учёта регистра/пробелов) и явно
+      // падаем с понятной ошибкой, если персонаж не найден.
+      const primaryCharacter = characters.find(
+        (c) => normalizeName(c.name) === normalizeName(scene.primary_character)
+      );
+      if (!primaryCharacter) {
+        throw new Error(
+          `Не найден персонаж "${scene.primary_character}" для сцены ${i + 1} среди загруженных: ` +
+          characters.map((c) => c.name).join(", ")
+        );
+      }
       const secondaryCharacters = (scene.secondary_characters || [])
-        .map((name) => characters.find((c) => c.name === name))
+        .map((name) => characters.find((c) => normalizeName(c.name) === normalizeName(name)))
         .filter(Boolean);
 
-      // Пробуем собрать полный кадр сцены через WaveSpeed (персонаж(и) + фон под описание).
-      // Если у аккаунта нет бесплатной квоты на генерацию изображений (частый случай
-      // на free tier без включённого биллинга) — используем фото персонажа напрямую,
-      // а фон/декорация всё равно попадут в кадр через текстовый промпт для Wan 2.2.
+      // Композитный кадр (несколько персонажей в одной сцене) нужен, только когда
+      // в сцене реально больше одного персонажа. Раньше он вызывался для КАЖДОЙ
+      // сцены, включая те, где есть только один персонаж с уже присланным реальным
+      // фото, — Nano Banana при этом пересоздавала лицо заново (искажая сходство)
+      // и иногда добавляла в кадр случайного "лишнего" человека, а заодно лишний раз
+      // жгла квоту WaveSpeed, приближая рейт-лимит. Для одиночных сцен просто
+      // используем присланное/сгенерированное фото персонажа как есть.
       let referenceImageUrl = primaryCharacter.ref_image_url;
-      try {
-        const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
-        referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
-      } catch (err) {
-        console.log(
-          `Композитный кадр недоступен (${err.message?.slice(0, 100)}), использую фото персонажа напрямую`
-        );
+      if (secondaryCharacters.length > 0) {
+        try {
+          const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
+          referenceImageUrl = await generateSceneReferenceImage(allCharacterUrls, scene.script_text);
+        } catch (err) {
+          console.log(
+            `Композитный кадр недоступен (${err.message?.slice(0, 100)}), использую фото персонажа напрямую`
+          );
+        }
       }
 
       const voiceoverUrl = scene.voiceover_text
