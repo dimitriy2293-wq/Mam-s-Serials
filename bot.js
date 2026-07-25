@@ -371,9 +371,18 @@ async function pollScenes(ctx, episodeId, attempt = 0) {
 
   if (allDone) {
     await ctx.reply("Все сцены готовы, собираю финальное видео...");
-    const finalPath = await assembleEpisode(refreshed);
-    await ctx.replyWithVideo({ source: finalPath });
-    await supabase.from("episodes").update({ status: "done" }).eq("id", episodeId);
+    try {
+      const finalPath = await assembleEpisode(refreshed);
+      await ctx.replyWithVideo({ source: finalPath });
+      await supabase.from("episodes").update({ status: "done" }).eq("id", episodeId);
+    } catch (err) {
+      console.error("Ошибка при сборке финального видео:", err);
+      await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
+      await ctx.reply(
+        "Все сцены сгенерировались, но не получилось склеить финальное видео (ошибка ffmpeg). " +
+        "Данные сцен сохранены, можно попробовать пересобрать вручную."
+      );
+    }
   } else if (anyError) {
     await ctx.reply("Одна из сцен не сгенерировалась. Проверь /episode_status позже.");
   } else if (attempt < 40) {
@@ -424,3 +433,4 @@ app.listen(PORT, async () => {
     console.log("RENDER_EXTERNAL_URL не задан — webhook не установлен автоматически");
   }
 });
+
