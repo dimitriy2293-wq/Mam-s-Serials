@@ -1,5 +1,9 @@
 FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
+# Говорим системе не задавать вопросов при установке пакетов
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Устанавливаем нужные пакеты
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     xvfb \
