@@ -13,7 +13,6 @@ import {
   checkBalance,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
-  obtainNewWaveSpeedKey,
 } from "./lib/wavespeed.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
