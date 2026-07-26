@@ -48,13 +48,22 @@ bot.command("start", async (ctx) => {
 
 // ---------- /update_key ----------
 bot.command("update_key", async (ctx) => {
+  // 1. Сразу отвечаем Telegram, чтобы он не обрывал соединение и не повторял запрос
   await ctx.reply("Запускаю браузер для добычи нового ключа WaveSpeed. Это займет около минуты...");
-  const key = await generateAndApplyNewKey();
-  if (key) {
-    await ctx.reply("Успех! Новый API-ключ получен и применен. Можно продолжать работу.");
-  } else {
-    await ctx.reply("Произошла ошибка при регистрации. Проверь логи Render.");
-  }
+
+  // 2. Запускаем процесс в фоне (без await!)
+  generateAndApplyNewKey()
+    .then(async (newKey) => {
+      if (newKey) {
+        await ctx.reply(`✅ Ключ успешно обновлен!`);
+      } else {
+        await ctx.reply("❌ Произошла ошибка при регистрации. Проверь логи Render.");
+      }
+    })
+    .catch(async (err) => {
+      console.error(err);
+      await ctx.reply("❌ Произошла критическая ошибка при обновлении ключа.");
+    });
 });
 
 // ---------- /replay ----------
