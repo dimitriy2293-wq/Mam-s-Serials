@@ -1,10 +1,10 @@
-import { createProxyMiddleware } from "http-proxy-middleware";
 import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import express from "express";
+import { createProxyMiddleware } from "http-proxy-middleware";
 import "dotenv/config";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
-import { generateAndApplyNewKey } from "./lib/wavespeed-auth.js"; // <-- Подключили наш скрипт
+import { generateAndApplyNewKey } from "./lib/wavespeed-auth.js";
 import {
   generateCharacterImages,
   generateSceneReferenceImage,
@@ -65,24 +65,6 @@ bot.command("update_key", async (ctx) => {
     });
 });
 
-// ---------- Express + VNC Proxy ----------
-const app = express();
-
-// Проксируем noVNC через общий порт Express
-const vncProxy = createProxyMiddleware({
-  target: "http://127.0.0.1:6080",
-  ws: true,
-  pathRewrite: { "^/vnc": "" },
-  logLevel: "silent"
-});
-
-app.use("/vnc", vncProxy);
-app.use(express.json());
-app.get("/", (req, res) => res.send("Bot is running"));
-app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
-
-// ... оставшаяся часть bot.js без изменений ...
-
 // ---------- /replay ----------
 bot.command("replay", async (ctx) => {
   const { data: episode, error } = await supabase
@@ -109,7 +91,6 @@ bot.command("replay", async (ctx) => {
 });
 
 // ---------- /new_episode ----------
-// Ошибка с точкой была здесь. Теперь синтаксис абсолютно чистый.
 bot.command("new_episode", async (ctx) => {
   ctx.session.step = "awaiting_draft_choice";
   ctx.session.draft = {};
@@ -450,194 +431,128 @@ async function processEpisode(ctx, episode) {
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
       const sceneNumber = i + 1;
-      const existing = existingByNumber.get(sceneNumber);
+      await ctx.reply(`Сцена ${sceneNumber}/${scenes.length}: ${scene.action_prompt}`);
 
-      if (existing && (existing.video_status === "processing" || existing.video_status === "done")) {
-        continue;
-      }
-
-      const primaryCharacter = characters.find(
-        (c) => normalizeName(c.name) === normalizeName(scene.primary_character)
-      );
-      if (!primaryCharacter) {
-        throw new Error(`Не найден персонаж "${scene.primary_character}"`);
-      }
-      const secondaryCharacters = (scene.secondary_characters || [])
-        .map((name) => characters.find((c) => normalizeName(c.name) === normalizeName(name)))
-        .filter(Boolean);
-
-      const location = locationByName.get(scene.location);
-      let referenceImageUrl = existing?.character_ref_image_url || primaryCharacter.ref_image_url;
-      let usedLocationComposite = !!existing?.character_ref_image_url;
-      if (!existing?.character_ref_image_url && location?.image_url) {
-        const allCharacterUrls = [primaryCharacter, ...secondaryCharacters].map((c) => c.ref_image_url);
-        for (let attempt = 0; attempt < 2 && !usedLocationComposite; attempt++) {
-          try {
-            referenceImageUrl = await generateSceneReferenceImage(
-              location.image_url,
-              allCharacterUrls,
-              scene.character_position || "standing naturally in the scene"
-            );
-            usedLocationComposite = true;
-          } catch (err) {
-            console.log(`Композитный кадр для сцены ${sceneNumber} не удался.`);
-          }
-        }
-        if (!usedLocationComposite && !compositeWarned) {
-          compositeWarned = true;
-          await ctx.reply("Не получилось встроить персонажа в фон локации для одной из сцен.").catch(() => {});
-        }
-      }
-
-      const videoPrompt = usedLocationComposite || !location
-        ? scene.script_text
-        : `${scene.script_text} Location: ${location.description}`;
-
-      let voiceoverUrl = existing?.voiceover_audio_url ?? null;
-      if (!voiceoverUrl && scene.voiceover_text) {
-        const speakerName = scene.primary_character;
-        const speakerDescription =
-          episode.script.characters.find((c) => normalizeName(c.name) === normalizeName(speakerName))
-            ?.description || "";
+      let record = existingByNumber.get(sceneNumber);
+      if (!record) {
+        let referenceImageUrl = null;
         try {
-          voiceoverUrl = await generateVoiceover(
-            scene.voiceover_text,
-            speakerName,
-            speakerDescription,
-            scene.voice_style
-          );
+          const loc = locationByName.get(scene.location_name);
+          const locationImageUrl = loc ? loc.image_url : null;
+          referenceImageUrl = await generateSceneReferenceImage({
+            scenePrompt: scene.action_prompt,
+            locationImageUrl,
+            charactersInScene: scene.character_names,
+            allCharacters: characters,
+            style: "Minecraft-style, blocky, low texture, vibrant colors", // <-- Жестко зашитый стиль
+          });
         } catch (err) {
+          console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
+        }
+
+        const { data: newScene } = await supabase
+          .from("scenes")
+          .insert({
+            episode_id: episode.id,
+            scene_number: sceneNumber,
+            prompt: scene.action_prompt,
+            status: "pending",
+            reference_image_url: referenceImageUrl,
+          })
+          .select()
+          .single();
+        record = newScene;
+
+        const charRefs = (scene.character_names || [])
+          .map((n) => characters.find((c) => c.name === n)?.ref_image_url)
+          .filter(Boolean);
+
+        const taskId = await generateVideoScene(
+          scene.action_prompt,
+          charRefs,
+          record.reference_image_url || undefined,
+          "Minecraft-style, blocky, low texture, vibrant colors"
+        );
+        await supabase
+          .from("scenes")
+          .update({ task_id: taskId, status: "processing" })
+          .eq("id", record.id);
+        record.task_id = taskId;
+        record.status = "processing";
+      }
+
+      if (scene.voiceover_text && !record.audio_url) {
+        try {
+          const audioUrl = await generateVoiceover(scene.voiceover_text, scene.voiceover_gender || "M");
+          await supabase.from("scenes").update({ audio_url: audioUrl }).eq("id", record.id);
+          record.audio_url = audioUrl;
+        } catch (err) {
+          console.error(`Ошибка озвучки (Сцена ${sceneNumber}):`, err.message);
           if (!voiceoverFailWarned) {
-            voiceoverFailWarned = true;
-            await ctx.reply("Озвучка не получилась для одной из сцен.").catch(() => {});
+             await ctx.reply("Возникли проблемы с озвучкой некоторых сцен. Они останутся без голоса.");
+             voiceoverFailWarned = true;
           }
         }
       }
-
-      const job = await generateVideoScene({
-        referenceImageUrl,
-        prompt: videoPrompt,
-        durationSec: scene.duration_sec,
-      });
-
-      const row = {
-        episode_id: episode.id,
-        scene_number: sceneNumber,
-        script_text: scene.script_text,
-        character_ref_image_url: referenceImageUrl,
-        video_job_id: job.job_id,
-        video_status: "processing",
-        voiceover_audio_url: voiceoverUrl,
-        duration_sec: scene.duration_sec,
-      };
-
-      if (existing) {
-        await supabase.from("scenes").update(row).eq("id", existing.id);
-      } else {
-        await supabase.from("scenes").insert(row);
-      }
     }
-  } catch (err) {
-    console.error("Ошибка при подготовке сцен эпизода:", err);
+
+    await pollScenes(ctx, episode.id);
+
+  } catch (error) {
+    console.error("Критическая ошибка в processEpisode:", error);
     await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply(
-      "Не получилось подготовить часть сцен эпизода. Продолжи командой /replay."
-    );
-    return;
-  }
-
-  await ctx.reply("Все сцены отправлены на генерацию. Проверяю статус...");
-  pollScenes(ctx, episode.id);
-}
-
-async function pollScenes(ctx, episodeId, attempt = 0) {
-  const { data: scenes } = await supabase
-    .from("scenes")
-    .select("*")
-    .eq("episode_id", episodeId)
-    .order("scene_number");
-
-  const pending = scenes.filter((s) => s.video_status === "processing");
-
-  for (const scene of pending) {
-    const status = await checkVideoStatus(scene.video_job_id);
-    if (status.done) {
-      await supabase
-        .from("scenes")
-        .update({ video_status: "done", video_url: status.video_url })
-        .eq("id", scene.id);
-    } else if (status.error) {
-      await supabase.from("scenes").update({ video_status: "error" }).eq("id", scene.id);
-    }
-  }
-
-  const { data: refreshed } = await supabase
-    .from("scenes")
-    .select("*")
-    .eq("episode_id", episodeId)
-    .order("scene_number");
-
-  const allDone = refreshed.every((s) => s.video_status === "done");
-  const anyError = refreshed.some((s) => s.video_status === "error");
-
-  if (allDone) {
-    await ctx.reply("Все сцены готовы, собираю финальное видео...");
-    try {
-      const finalPath = await assembleEpisode(refreshed);
-      await ctx.replyWithVideo(new InputFile(finalPath));
-      await supabase.from("episodes").update({ status: "done" }).eq("id", episodeId);
-    } catch (err) {
-      console.error("Ошибка при сборке финального видео:", err);
-      await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
-      await ctx.reply("Не получилось склеить финальное видео.");
-    }
-  } else if (anyError) {
-    await ctx.reply("Одна из сцен не сгенерировалась. Проверь позже.");
-  } else if (attempt < 40) {
-    setTimeout(() => pollScenes(ctx, episodeId, attempt + 1), 15000);
-  } else {
-    await ctx.reply("Генерация занимает необычно долго.");
+    await ctx.reply("Генерация прервалась из-за ошибки. Ты можешь возобновить её с помощью /replay.");
   }
 }
 
-function formatScriptPreview(script) {
-  return script.scenes
-    .map((s, i) => `Сцена ${i + 1} (${s.duration_sec}с): ${s.script_text}`)
-    .join("\n");
-}
+async function pollScenes(ctx, episodeId) {
+  let isDone = false;
+  let compositeWarned = false;
 
-await ensureBucket();
+  while (!isDone) {
+    await new Promise((res) => setTimeout(res, 30_000));
+    const { data: scenes } = await supabase
+      .from("scenes")
+      .select("*")
+      .eq("episode_id", episodeId);
 
-const app = express(); // <--- Оставляем только один раз!
+    const pending = scenes.filter((s) => s.status === "processing" || s.status === "pending");
 
-// Проксируем noVNC через общий порт Express
-const vncProxy = createProxyMiddleware({
-  target: "http://127.0.0.1:6080",
-  ws: true,
-  pathRewrite: { "^/vnc": "" },
-  logLevel: "silent"
-});
+    if (pending.length === 0) {
+      isDone = true;
+      const allSuccess = scenes.every((s) => s.status === "completed" && s.video_url);
 
-app.use("/vnc", vncProxy);
-app.use(express.json());
-app.get("/", (req, res) => res.send("Bot is running"));
-app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
+      if (!allSuccess) {
+         if (!compositeWarned) {
+             await ctx.reply("Некоторые сцены не удалось сгенерировать. Собираю эпизод из того, что получилось.");
+             compositeWarned = true;
+         }
+      }
 
-bot.catch((err) => {
-  console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
-  err.ctx.reply("Произошла ошибка при обработке. Попробуй ещё раз или начни заново с /new_episode.").catch(() => {});
-});
+      const validScenes = scenes.filter(s => s.status === "completed" && s.video_url).sort((a, b) => a.scene_number - b.scene_number);
 
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled rejection:", err);
-});
+      if (validScenes.length === 0) {
+         await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
+         await ctx.reply("Не удалось сгенерировать ни одной сцены.");
+         return;
+      }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`Server listening on port ${PORT}`);
-  const publicUrl = process.env.RENDER_EXTERNAL_URL;
-  if (publicUrl) {
-    await bot.api.setWebhook(publicUrl);
-    console.log("Webhook set to", publicUrl);
-  }
-});
+      await ctx.reply("Видео сгенерировано! Начинаю сборку со звуком...");
+      try {
+        const finalUrl = await assembleEpisode(validScenes, episodeId);
+        await supabase.from("episodes").update({ status: "completed", final_video_url: finalUrl }).eq("id", episodeId);
+        await ctx.reply(`Готово! Вот твой сериал:\n${finalUrl}\n\nНачать новый — /new_episode.`);
+      } catch (err) {
+        console.error("Ошибка сборки:", err);
+        await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
+        await ctx.reply("Видео готовы, но не получилось собрать их вместе (FFmpeg). Попробуй /replay позже.");
+      }
+    } else {
+      for (const scene of pending) {
+        if (!scene.task_id) continue;
+        try {
+          const status = await checkVideoStatus(scene.task_id);
+          if (status.status === "COMPLETED") {
+            await supabase
+              .from("scenes")
+              .update({ status: "completed", video_url: stat
