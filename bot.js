@@ -90,21 +90,13 @@ bot.command("replay", async (ctx) => {
 
 // ---------- /new_episode ----------
 bot.command("new_episode", async (ctx) => {
-  await ctx.reply("Запускаю подготовку эпизода и обновление ключа доступа...");
-
-  try {
-    const freshApiKey = await obtainNewWaveSpeedKey();
-    if (freshApiKey) {
-      process.env.WAVESPEED_API_KEY = freshApiKey;
-      console.log("WaveSpeed API ключ успешно обновлен для текущей сессии.");
-    }
-  } catch (e) {
-    console.log("Не удалось обнуть ключ автоматически, продолжаем со старым:", e.message);
-  }
+  await ctx.reply("Запускаю подготовку эпизода...");
 
   ctx.session.step = "awaiting_draft_choice";
   ctx.session.draft = {};
   const kb = new InlineKeyboard()
+  // ... дальше твой код
+});
     .text("У меня есть сюжет", "draft_yes")
     .text("Сгенерировать с нуля", "draft_no");
   await ctx.reply("Есть у тебя готовая идея сюжета, или сгенерировать с нуля?", {
