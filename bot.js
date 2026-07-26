@@ -13,6 +13,7 @@ import {
   checkBalance,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
+  obtainNewWaveSpeedKey,
 } from "./lib/wavespeed.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
@@ -89,6 +90,18 @@ bot.command("replay", async (ctx) => {
 
 // ---------- /new_episode ----------
 bot.command("new_episode", async (ctx) => {
+  await ctx.reply("Запускаю подготовку эпизода и обновление ключа доступа...");
+
+  try {
+    const freshApiKey = await obtainNewWaveSpeedKey();
+    if (freshApiKey) {
+      process.env.WAVESPEED_API_KEY = freshApiKey;
+      console.log("WaveSpeed API ключ успешно обновлен для текущей сессии.");
+    }
+  } catch (e) {
+    console.log("Не удалось обнуть ключ автоматически, продолжаем со старым:", e.message);
+  }
+
   ctx.session.step = "awaiting_draft_choice";
   ctx.session.draft = {};
   const kb = new InlineKeyboard()
