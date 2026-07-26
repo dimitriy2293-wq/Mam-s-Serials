@@ -608,7 +608,17 @@ function formatScriptPreview(script) {
 
 await ensureBucket();
 
-const app = express();
+const app = express(); // <--- Оставляем только один раз!
+
+// Проксируем noVNC через общий порт Express
+const vncProxy = createProxyMiddleware({
+  target: "http://127.0.0.1:6080",
+  ws: true,
+  pathRewrite: { "^/vnc": "" },
+  logLevel: "silent"
+});
+
+app.use("/vnc", vncProxy);
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
 app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
