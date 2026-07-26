@@ -106,7 +106,7 @@ bot.command("new_episode", async (ctx) => {
 bot.callbackQuery("draft_yes", async (ctx) => {
   ctx.session.step = "awaiting_draft_text";
   await safeAnswer(ctx);
-  await ctx.reply("Пришли текстом свою идею/черновик сюжета (можно коротко, ИИ доработает).");
+  await ctx.reply("Пришли текстом свою идею/черновик сюжета (можно коротко, ИИ доработкает).");
 });
 
 bot.callbackQuery("draft_no", async (ctx) => {
@@ -161,7 +161,6 @@ bot.on("message:text", async (ctx, next) => {
   }
 });
 
-// ---------- Настройка фона ----------
 async function askLocationStep(ctx) {
   const { locations, locationQueueIndex } = ctx.session.draft;
   if (locationQueueIndex >= locations.length) {
@@ -237,7 +236,6 @@ bot.callbackQuery("chars_ai", async (ctx) => {
   }
 });
 
-// ---------- Приём фото ----------
 bot.on("message:photo", async (ctx) => {
   if (ctx.session.step === "awaiting_location_photo") {
     const fileId = ctx.message.photo.at(-1).file_id;
@@ -302,7 +300,6 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
   }
 });
 
-// ---------- Завершение сбора персонажей ----------
 bot.command("done", async (ctx) => {
   if (ctx.session.step !== "awaiting_character_photos") {
     await ctx.reply("Начни заново: /new_episode");
@@ -328,7 +325,6 @@ bot.command("done", async (ctx) => {
   await confirmAndEstimateCredits(ctx);
 });
 
-// ---------- Подтверждение перед тратой $ ----------
 async function confirmAndEstimateCredits(ctx) {
   try {
     const scenes = ctx.session.draft.script.scenes;
@@ -425,7 +421,6 @@ async function processEpisode(ctx, episode) {
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
 
   let voiceoverFailWarned = false;
-  let compositeWarned = false;
 
   try {
     for (let i = 0; i < scenes.length; i++) {
@@ -556,4 +551,65 @@ async function pollScenes(ctx, episodeId) {
             await supabase
               .from("scenes")
               .update({ status: "completed", video_url: status.video_url })
-            
+              .eq("id", scene.id);
+            await ctx.reply(`✅ Сцена ${scene.scene_number} готова!`);
+          } else if (status.status === "FAILED") {
+            await supabase
+              .from("scenes")
+            .update({ status: "failed" })
+              .eq("id", scene.id);
+            await ctx.reply(`❌ Ошибка генерации сцены ${scene.scene_number}.`);
+          }
+        } catch (err) {
+          console.error(`Ошибка проверки сцены ${scene.id}:`, err);
+        }
+      }
+    }
+  }
+}
+
+function formatScriptPreview(script) {
+  return script.scenes
+    .map(
+      (s, i) =>
+        `**Сцена ${i + 1}**: ${s.action_prompt}\n` +
+        `   Локация: ${s.location_name}\n` +
+        `   Персонажи: ${(s.character_names || []).join(", ")}\n`
+    )
+    .join("\n");
+}
+
+await ensureBucket();
+
+const app = express();
+
+const vncProxy = createProxyMiddleware({
+  target: "http://127.0.0.1:6080",
+  ws: true,
+  pathRewrite: { "^/vnc": "" },
+  logLevel: "silent"
+});
+
+app.use("/vnc", vncProxy);
+app.use(express.json());
+app.get("/", (req, res) => res.send("Bot is running"));
+app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
+
+bot.catch((err) => {
+  console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
+  err.ctx.reply("Произошла ошибка при обработке. Попробуй ещё раз или начни заново с /new_episode.").catch(() => {});
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  const publicUrl = process.env.RENDER_EXTERNAL_URL;
+  if (publicUrl) {
+    await bot.api.setWebhook(publicUrl);
+    console.log("Webhook set to", publicUrl);
+  }
+});
