@@ -1,17 +1,21 @@
-# Используем официальный образ с зависимостями для браузеров
 FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
-# Устанавливаем ffmpeg (он нужен для склейки видео)
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --production
 
-# Устанавливаем сам браузер Chromium
 RUN npx playwright install chromium
 
 COPY . .
 
 EXPOSE 3000
-CMD ["node", "bot.js"]
+
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x1024x24 & x11vnc -forever -shared -rfbport 5900 -display :99 & websockify --web /usr/share/novnc/ 6080 localhost:5900 & DISPLAY=:99 node bot.js"]
