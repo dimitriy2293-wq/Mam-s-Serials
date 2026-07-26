@@ -1,16 +1,15 @@
-FROM node:18-slim
+# Используем официальный образ с зависимостями для браузеров
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
-# Устанавливаем ffmpeg и базовые утилиты
-RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*
+# Устанавливаем ffmpeg (он нужен для склейки видео)
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY package*.json ./
+RUN npm install --production
 
-# Устанавливаем пакеты
-RUN npm install
-
-# Устанавливаем ТОЛЬКО Chromium и его системные зависимости (чтобы не качать лишнее)
-RUN npx playwright install chromium --with-deps
+# Устанавливаем сам браузер Chromium
+RUN npx playwright install chromium
 
 COPY . .
 
