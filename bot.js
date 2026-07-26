@@ -444,7 +444,7 @@ async function processEpisode(ctx, episode) {
             locationImageUrl,
             charactersInScene: scene.character_names,
             allCharacters: characters,
-            style: "Minecraft-style, blocky, low texture, vibrant colors", // <-- Жестко зашитый стиль
+            style: "Minecraft-style, blocky, low texture, vibrant colors",
           });
         } catch (err) {
           console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
@@ -555,4 +555,5 @@ async function pollScenes(ctx, episodeId) {
           if (status.status === "COMPLETED") {
             await supabase
               .from("scenes")
-              .update({ status: "completed", video_url: stat
+              .update({ status: "completed", video_url: status.video_url })
+            
