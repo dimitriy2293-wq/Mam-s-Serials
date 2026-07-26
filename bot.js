@@ -1,3 +1,4 @@
+import { createProxyMiddleware } from "http-proxy-middleware";
 import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import express from "express";
 import "dotenv/config";
@@ -48,14 +49,12 @@ bot.command("start", async (ctx) => {
 
 // ---------- /update_key ----------
 bot.command("update_key", async (ctx) => {
-  // 1. Сразу отвечаем Telegram, чтобы он не обрывал соединение и не повторял запрос
-  await ctx.reply("Запускаю браузер для добычи нового ключа WaveSpeed. Это займет около минуты...");
+  await ctx.reply("Запускаю браузер для регистрации нового аккаунта через GitHub. Ожидай ссылку на капчу...");
 
-  // 2. Запускаем процесс в фоне (без await!)
-  generateAndApplyNewKey()
+  generateAndApplyNewKey(bot, ctx.chat.id)
     .then(async (newKey) => {
       if (newKey) {
-        await ctx.reply(`✅ Ключ успешно обновлен!`);
+        await ctx.reply(`✅ Ключ успешно обновлен и применен!`);
       } else {
         await ctx.reply("❌ Произошла ошибка при регистрации. Проверь логи Render.");
       }
@@ -65,6 +64,24 @@ bot.command("update_key", async (ctx) => {
       await ctx.reply("❌ Произошла критическая ошибка при обновлении ключа.");
     });
 });
+
+// ---------- Express + VNC Proxy ----------
+const app = express();
+
+// Проксируем noVNC через общий порт Express
+const vncProxy = createProxyMiddleware({
+  target: "http://127.0.0.1:6080",
+  ws: true,
+  pathRewrite: { "^/vnc": "" },
+  logLevel: "silent"
+});
+
+app.use("/vnc", vncProxy);
+app.use(express.json());
+app.get("/", (req, res) => res.send("Bot is running"));
+app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
+
+// ... оставшаяся часть bot.js без изменений ...
 
 // ---------- /replay ----------
 bot.command("replay", async (ctx) => {
