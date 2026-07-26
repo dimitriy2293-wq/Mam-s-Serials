@@ -1,12 +1,14 @@
 {
-  "name": "serial-bot",
+  "name": "mam-s-serials",
   "version": "1.0.0",
-  "type": "module",
+  "description": "",
   "main": "bot.js",
+  "type": "module",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "grammy": "^1.21.1",
