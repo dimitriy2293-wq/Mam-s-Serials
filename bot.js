@@ -12,6 +12,7 @@ import {
   checkVideoStatus,
   checkBalance,
   estimateEpisodeCostUsd,
+  estimateMaxScenes,
 } from "./lib/wavespeed.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
@@ -124,9 +125,14 @@ bot.on("message:text", async (ctx, next) => {
     const isDraft = step === "awaiting_draft_text";
     await ctx.reply("Дорабатываю сценарий...");
 
+    // Бюджет по умолчанию — $1 (генерация каждой сцены стоит реальных денег на
+    // WaveSpeed), поэтому сразу считаем, сколько сцен в него помещается, и просим
+    // Gemini уложиться в это число, а не жалуемся постфактум после генерации.
+    const maxScenes = estimateMaxScenes(1, { locationCount: 1, characterCount: 2 });
+
     let script;
     try {
-      script = await generateScript({ userInput: ctx.message.text, isDraft });
+      script = await generateScript({ userInput: ctx.message.text, isDraft, maxScenes });
     } catch (err) {
       console.error("Ошибка генерации сценария:", err);
       await ctx.reply("Gemini сейчас перегружен и не ответил после нескольких попыток. Попробуй ещё раз через минуту — просто пришли текст заново.");
@@ -342,6 +348,7 @@ async function confirmAndEstimateCredits(ctx) {
       sceneCount: scenes.length,
       locationCount: locationsNeedingGen,
       voiceoverSceneCount,
+      characterCount: ctx.session.draft.characters.length,
     });
 
     // Проверяем реальный баланс на WaveSpeed ДО старта, а не узнаём о его нехватке
