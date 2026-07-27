@@ -7,6 +7,7 @@
     "start": "node bot.js"
   },
   "dependencies": {
+    "@novnc/novnc": "^1.4.0",
     "grammy": "^1.30.0",
     "@supabase/supabase-js": "^2.45.0",
     "@google/genai": "^0.15.0",
