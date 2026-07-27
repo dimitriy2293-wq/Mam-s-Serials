@@ -601,7 +601,6 @@ const vncWsProxy = createProxyMiddleware({
   logLevel: "silent"
 });
 app.use("/websockify", vncWsProxy); // По умолчанию noVNC ищет видео-поток тут
-app.use("/vnc", vncWsProxy);       // Оставил как фоллбэк, если WebSocket пойдет сюда
 
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
