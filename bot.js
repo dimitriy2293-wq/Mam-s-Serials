@@ -2,6 +2,8 @@ import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import "dotenv/config";
+import path from "path";
+import { fileURLToPath } from "url";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
 import { generateAndApplyNewKey } from "./lib/wavespeed-auth.js";
@@ -19,6 +21,10 @@ import {
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
+
+// Настройка путей
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -583,14 +589,20 @@ await ensureBucket();
 
 const app = express();
 
-const vncProxy = createProxyMiddleware({
+// === ИСПРАВЛЕНИЕ ОШИБКИ 404 VNC ===
+// 1. Отдаем графику noVNC напрямую через Express из папки node_modules (или системной)
+app.use("/vnc", express.static(path.join(__dirname, "node_modules/@novnc/novnc")));
+app.use("/vnc", express.static("/usr/share/novnc")); // Резервный вариант, если стоит глобально в Docker
+
+// 2. Проксируем ТОЛЬКО WebSocket-поток (видео с экрана) на порт 6080
+const vncWsProxy = createProxyMiddleware({
   target: "http://127.0.0.1:6080",
   ws: true,
-  pathRewrite: { "^/vnc": "" },
   logLevel: "silent"
 });
+app.use("/websockify", vncWsProxy); // По умолчанию noVNC ищет видео-поток тут
+app.use("/vnc", vncWsProxy);       // Оставил как фоллбэк, если WebSocket пойдет сюда
 
-app.use("/vnc", vncProxy);
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
 app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
