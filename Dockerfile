@@ -22,4 +22,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x1024x24 & x11vnc -forever -shared -rfbport 5900 -display :99 & websockify --web /usr/share/novnc/ 6080 localhost:5900 & DISPLAY=:99 node bot.js"]
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & x11vnc -forever -shared -rfbport 5900 -display :99 & websockify --web /usr/share/novnc/ 6080 localhost:5900 & DISPLAY=:99 node bot.js"]
