@@ -592,7 +592,7 @@ const app = express();
 // === ИСПРАВЛЕНИЕ ОШИБКИ 404 VNC ===
 // 1. Отдаем графику noVNC напрямую через Express из папки node_modules (или системной)
 // Отдаем графику noVNC
-app.use("/vnc", express.static(path.join(__dirname, "node_modules/@novnc/novnc")));
+app.use("/vnc", express.static("/usr/share/novnc"));
 
 // Проксируем ТОЛЬКО WebSocket-поток (видео с экрана) на порт 6080
 const vncWsProxy = createProxyMiddleware({
