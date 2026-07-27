@@ -591,20 +591,22 @@ const app = express();
 
 // === ИСПРАВЛЕНИЕ ОШИБКИ 404 VNC ===
 // 1. Отдаем графику noVNC напрямую через Express из папки node_modules (или системной)
+// Отдаем графику noVNC
 app.use("/vnc", express.static(path.join(__dirname, "node_modules/@novnc/novnc")));
-app.use("/vnc", express.static("/usr/share/novnc")); // Резервный вариант, если стоит глобально в Docker
 
-// 2. Проксируем ТОЛЬКО WebSocket-поток (видео с экрана) на порт 6080
+// Проксируем ТОЛЬКО WebSocket-поток (видео с экрана) на порт 6080
 const vncWsProxy = createProxyMiddleware({
   target: "http://127.0.0.1:6080",
   ws: true,
   logLevel: "silent"
 });
-app.use("/websockify", vncWsProxy); // По умолчанию noVNC ищет видео-поток тут
+app.use("/websockify", vncWsProxy); // Видео пойдет только сюда!
 
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
 app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
+
+// ... дальше идут обработчики ошибок и app.listen
 
 bot.catch((err) => {
   console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
