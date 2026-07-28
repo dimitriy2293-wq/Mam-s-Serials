@@ -5,7 +5,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
-import { step1_start, step2_finish } from "./lib/wavespeed-auth.js";
 import {
   generateCharacterImages,
   generateSceneReferenceImage,
@@ -48,19 +47,78 @@ bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету.\n\n" +
     "Нажми /new_episode чтобы начать новый эпизод.\n" +
-    "Команда /update_key — получить новый API ключ WaveSpeed.\n" +
-    "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось."
+    "Команда `/update_key <твой_ключ>` — обновить API ключ WaveSpeed.\n" +
+    "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось.",
+    { parse_mode: "Markdown" }
   );
 });
 
-// ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЭТАП 1) ----------
+// ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЧЕРЕЗ RENDER API) ----------
 bot.command("update_key", async (ctx) => {
-  await step1_start(bot, ctx.chat.id);
+  // Получаем ключ из текста сообщения после команды
+  const newKey = ctx.match ? ctx.match.trim() : "";
+
+  if (!newKey) {
+    return ctx.reply(
+      "❌ **Ошибка:** Укажи новый ключ после команды!\n\nПример:\n`/update_key твой_новый_ключ_wavespeed`", 
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  const renderApiKey = process.env.RENDER_API_KEY;
+  const serviceId = process.env.RENDER_SERVICE_ID; 
+
+  if (!renderApiKey || !serviceId) {
+    return ctx.reply(
+      "❌ В `process.env` не найдены `RENDER_API_KEY` или `RENDER_SERVICE_ID`!\nПроверь их наличие во вкладке Environment на Render."
+    );
+  }
+
+  const statusMsg = await ctx.reply("⏳ Отправляю запрос в Render API для обновления `WAVESPEED_API_KEY`...");
+
+  try {
+    const response = await fetch(`https://api.render.com/v1/services/${serviceId}/env-vars/WAVESPEED_API_KEY`, {
+      method: "PUT",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${renderApiKey}`
+      },
+      body: JSON.stringify({
+        value: newKey
+      })
+    });
+
+    if (response.ok) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        "✅ **Ключ WAVESPEED_API_KEY успешно обновлен в Render!**\n\n🔄 Бот автоматически перезапускается с новым ключом (это займет около 1 минуты).",
+        { parse_mode: "Markdown" }
+      );
+    } else {
+      const errorData = await response.json().catch(() => ({ message: response.statusText }));
+      console.error("Render API error:", errorData);
+      
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        `❌ **Ошибка Render API (${response.status}):** ${errorData.message || response.statusText}`
+      );
+    }
+  } catch (error) {
+    console.error("Fetch error:", error);
+    await ctx.api.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      "❌ Произошла ошибка при соединении с сервером Render."
+    );
+  }
 });
 
-// ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЭТАП 2) ----------
+// ---------- /finish_key (Заглушка) ----------
 bot.command("finish_key", async (ctx) => {
-  await step2_finish(bot, ctx.chat.id);
+  await ctx.reply("Автоматический забор ключа отключен. Используй команду `/update_key ТВОЙ_КЛЮЧ`.", { parse_mode: "Markdown" });
 });
 
 // ---------- /replay ----------
@@ -229,7 +287,8 @@ bot.callbackQuery("chars_ai", async (ctx) => {
     console.error("Ошибка генерации персонажей:", err);
     await ctx.reply(
       "Не получилось сгенерировать персонажей через ИИ — WaveSpeed не ответил. " +
-      "Попробуй /update_key для обновления токена, либо пришли фото вручную."
+      "Попробуй `/update_key КЛЮЧ` для обновления токена, либо пришли фото вручную.",
+      { parse_mode: "Markdown" }
     );
   }
 });
@@ -300,7 +359,7 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
 
 bot.command("done", async (ctx) => {
   if (ctx.session.step !== "awaiting_character_photos") {
-    await ctx.reply("Если ты завершил регистрацию ключа, отправь /finish_key.\nЕсли хочешь создать эпизод — отправь /new_episode.");
+    await ctx.reply("Если хочешь обновить API ключ — отправь `/update_key КЛЮЧ`.\nЕсли хочешь создать эпизод — отправь /new_episode.", { parse_mode: "Markdown" });
     return;
   }
 
@@ -352,14 +411,14 @@ async function confirmAndEstimateCredits(ctx) {
       balanceLine = `\nБаланс WaveSpeed: $${balance.toFixed(2)}.`;
       if (balance < estimatedCost) {
         balanceLine +=
-          `\n⚠️ Баланса может не хватить на весь эпизод. Воспользуйся /update_key для смены аккаунта.`;
+          `\n⚠️ Баланса может не хватить на весь эпизод. Воспользуйся \`/update_key КЛЮЧ\` для смены аккаунта.`;
       }
     }
 
     await ctx.reply(
       `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
       `Примерно $${estimatedCost.toFixed(2)} на WaveSpeed.${balanceLine}\n\nПодтверждаешь генерацию?`,
-      { reply_markup: kb }
+      { reply_markup: kb, parse_mode: "Markdown" }
     );
   } catch (err) {
     console.error("Ошибка в confirmAndEstimateCredits:", err);
