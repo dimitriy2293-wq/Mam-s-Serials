@@ -1,12 +1,11 @@
 import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import express from "express";
-import { createProxyMiddleware } from "http-proxy-middleware";
 import "dotenv/config";
 import path from "path";
 import { fileURLToPath } from "url";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
-import { generateAndApplyNewKey } from "./lib/wavespeed-auth.js";
+import { step1_start, step2_finish } from "./lib/wavespeed-auth.js";
 import {
   generateCharacterImages,
   generateSceneReferenceImage,
@@ -49,26 +48,19 @@ bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету.\n\n" +
     "Нажми /new_episode чтобы начать новый эпизод.\n" +
+    "Команда /update_key — получить новый API ключ WaveSpeed.\n" +
     "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось."
   );
 });
 
-// ---------- /update_key ----------
+// ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЭТАП 1) ----------
 bot.command("update_key", async (ctx) => {
-  await ctx.reply("Запускаю браузер для регистрации нового аккаунта через GitHub. Ожидай ссылку на капчу...");
+  await step1_start(bot, ctx.chat.id);
+});
 
-  generateAndApplyNewKey(bot, ctx.chat.id)
-    .then(async (newKey) => {
-      if (newKey) {
-        await ctx.reply(`✅ Ключ успешно обновлен и применен!`);
-      } else {
-        await ctx.reply("❌ Произошла ошибка при регистрации. Проверь логи Render.");
-      }
-    })
-    .catch(async (err) => {
-      console.error(err);
-      await ctx.reply("❌ Произошла критическая ошибка при обновлении ключа.");
-    });
+// ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЭТАП 2) ----------
+bot.command("finish_key", async (ctx) => {
+  await step2_finish(bot, ctx.chat.id);
 });
 
 // ---------- /replay ----------
@@ -308,7 +300,7 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
 
 bot.command("done", async (ctx) => {
   if (ctx.session.step !== "awaiting_character_photos") {
-    await ctx.reply("Начни заново: /new_episode");
+    await ctx.reply("Если ты завершил регистрацию ключа, отправь /finish_key.\nЕсли хочешь создать эпизод — отправь /new_episode.");
     return;
   }
 
@@ -589,24 +581,9 @@ await ensureBucket();
 
 const app = express();
 
-// === ИСПРАВЛЕНИЕ ОШИБКИ 404 VNC ===
-// 1. Отдаем графику noVNC напрямую через Express из папки node_modules (или системной)
-// Отдаем графику noVNC
-app.use("/vnc", express.static("/usr/share/novnc"));
-
-// Проксируем ТОЛЬКО WebSocket-поток (видео с экрана) на порт 6080
-const vncWsProxy = createProxyMiddleware({
-  target: "http://127.0.0.1:6080",
-  ws: true,
-  logLevel: "silent"
-});
-app.use("/websockify", vncWsProxy); // Видео пойдет только сюда!
-
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
 app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
-
-// ... дальше идут обработчики ошибок и app.listen
 
 bot.catch((err) => {
   console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
