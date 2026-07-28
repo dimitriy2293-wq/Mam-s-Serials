@@ -1,0 +1,23 @@
+{
+  "name": "serial-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@novnc/novnc": "^1.4.0",
+    "grammy": "^1.30.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "@google/genai": "^0.15.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "http-proxy-middleware": "^3.0.0",
+    "playwright": "^1.42.1",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.18.0",
+    "playwright-extra": "^4.3.1",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
