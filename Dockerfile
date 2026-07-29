@@ -17,6 +17,10 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --production
 
+# ДОБАВЛЕНО: Принудительно ставим плагины для обхода блокировок
+RUN npm install playwright-extra puppeteer-extra-plugin-stealth node-fetch
+
+# Устанавливаем сам браузер
 RUN npx playwright install chromium
 
 COPY . .
