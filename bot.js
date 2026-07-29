@@ -15,13 +15,15 @@ import {
   estimateEpisodeCostUsd,
   estimateMaxScenes,
 } from "./lib/wavespeed.js";
-// Озвучка сериала — через ElevenLabs (сам определяет язык/голос), см. lib/elevenlabs.js
 import { generateVoiceover } from "./lib/elevenlabs.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
 import { isUrl, fetchArticle, generateShortScript } from "./lib/shorts-script.js";
 import { assembleShort } from "./lib/shorts-assemble.js";
+
+// ДОБАВЛЕНО: Импорт функций обхода WaveSpeed
+import { step1_start, step2_finish } from "./lib/wavespeed-auth.js";
 
 // Настройка путей
 const __filename = fileURLToPath(import.meta.url);
@@ -51,30 +53,29 @@ bot.command("start", async (ctx) => {
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету, а ещё умею делать короткие TikTok-style видео.\n\n" +
     "Нажми /new_episode чтобы начать новый эпизод сериала.\n" +
     "Нажми /new_short чтобы сделать короткое видео (30-40 сек) по ссылке на статью или по теме.\n" +
-    "Команда `/update_key <твой_ключ>` — обновить API ключ WaveSpeed.\n" +
+    "Команда `/update_key` — автоматическое обновление ключа WaveSpeed.\n" +
+    "Команда `/update_key <ключ>` — ручное обновление.\n" +
     "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось.",
     { parse_mode: "Markdown" }
   );
 });
 
-// ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЧЕРЕЗ RENDER API) ----------
+// ---------- ОБНОВЛЕНИЕ КЛЮЧА ----------
 bot.command("update_key", async (ctx) => {
-  // Получаем ключ из текста сообщения после команды
   const newKey = ctx.match ? ctx.match.trim() : "";
 
+  // Если ключ не передан вручную — запускаем автоматический обход (Playwright)
   if (!newKey) {
-    return ctx.reply(
-      "❌ **Ошибка:** Укажи новый ключ после команды!\n\nПример:\n`/update_key твой_новый_ключ_wavespeed`", 
-      { parse_mode: "Markdown" }
-    );
+    return step1_start(bot, ctx.chat.id);
   }
 
+  // Ручное обновление ключа через Render API
   const renderApiKey = process.env.RENDER_API_KEY;
   const serviceId = process.env.RENDER_SERVICE_ID; 
 
   if (!renderApiKey || !serviceId) {
     return ctx.reply(
-      "❌ В `process.env` не найдены `RENDER_API_KEY` или `RENDER_SERVICE_ID`!\nПроверь их наличие во вкладке Environment на Render."
+      "❌ В `process.env` не найдены `RENDER_API_KEY` или `RENDER_SERVICE_ID`!"
     );
   }
 
@@ -88,9 +89,7 @@ bot.command("update_key", async (ctx) => {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${renderApiKey}`
       },
-      body: JSON.stringify({
-        value: newKey
-      })
+      body: JSON.stringify({ value: newKey })
     });
 
     if (response.ok) {
@@ -102,8 +101,6 @@ bot.command("update_key", async (ctx) => {
       );
     } else {
       const errorData = await response.json().catch(() => ({ message: response.statusText }));
-      console.error("Render API error:", errorData);
-      
       await ctx.api.editMessageText(
         ctx.chat.id,
         statusMsg.message_id,
@@ -111,7 +108,6 @@ bot.command("update_key", async (ctx) => {
       );
     }
   } catch (error) {
-    console.error("Fetch error:", error);
     await ctx.api.editMessageText(
       ctx.chat.id,
       statusMsg.message_id,
@@ -120,9 +116,10 @@ bot.command("update_key", async (ctx) => {
   }
 });
 
-// ---------- /finish_key (Заглушка) ----------
+// ---------- ЗАВЕРШЕНИЕ ОБНОВЛЕНИЯ ----------
 bot.command("finish_key", async (ctx) => {
-  await ctx.reply("Автоматический забор ключа отключен. Используй команду `/update_key ТВОЙ_КЛЮЧ`.", { parse_mode: "Markdown" });
+  // Вызываем второй шаг автоматизации (логин в WaveSpeed и извлечение ключа)
+  await step2_finish(bot, ctx.chat.id);
 });
 
 // ---------- /replay ----------
@@ -158,9 +155,7 @@ bot.command("new_episode", async (ctx) => {
     .text("У меня есть сюжет", "draft_yes")
     .text("Сгенерировать с нуля", "draft_no");
     
-  await ctx.reply("Есть у тебя готовая идея сюжета, или сгенерировать с нуля?", {
-    reply_markup: kb,
-  });
+  await ctx.reply("Есть у тебя готовая идея сюжета, или сгенерировать с нуля?", { reply_markup: kb });
 });
 
 bot.callbackQuery("draft_yes", async (ctx) => {
@@ -175,13 +170,12 @@ bot.callbackQuery("draft_no", async (ctx) => {
   await ctx.reply("Опиши тему/жанр для сериала (например: 'комедия про аэропорт').");
 });
 
-// ---------- /new_short — короткое TikTok-style видео ----------
+// ---------- /new_short ----------
 bot.command("new_short", async (ctx) => {
   ctx.session.step = "awaiting_short_input";
   ctx.session.shortDraft = {};
   await ctx.reply(
     "Пришли ссылку на статью, или просто опиши тему/идею для короткого видео (30-40 сек).\n\n" +
-    "Если это похоже на реальную новость — сделаю пересказ по фактам, если это творческая идея — придумаю историю.\n\n" +
     "Голос — русский (ElevenLabs), субтитры слово-за-словом, видео/фото со стоков (Pexels/Pixabay)."
   );
 });
@@ -232,13 +226,12 @@ bot.on("message:text", async (ctx, next) => {
   }
 
   if (step === "awaiting_short_input") {
-    ctx.session.step = null; // сбрасываем сразу, чтобы /new_short можно было запустить заново, не дожидаясь конца сборки
+    ctx.session.step = null;
     await runShortPipeline(ctx, ctx.message.text.trim());
     return;
   }
 });
 
-// ---------- Пайплайн генерации короткого видео (TikTok-style) ----------
 async function runShortPipeline(ctx, rawInput) {
   const chatId = ctx.chat.id;
   let script;
@@ -248,16 +241,9 @@ async function runShortPipeline(ctx, rawInput) {
       await ctx.reply("Загружаю статью по ссылке...");
       const { text: articleText, ogImage } = await fetchArticle(rawInput);
       if (!articleText || articleText.length < 200) {
-        await ctx.reply(
-          "Не получилось вытащить достаточно текста со страницы (возможно, сайт блокирует ботов). " +
-          "Пришли текст статьи или тему сообщением вместо ссылки."
-        );
+        await ctx.reply("Не получилось вытащить достаточно текста. Пришли текст статьи.");
         return;
       }
-      // Примечание: og:image статьи НЕ используется в сборке ролика — фото со стоков
-      // (Pexels/Pixabay) безопаснее в плане авторских прав, чем изображения из
-      // конкретной статьи, которые обычно принадлежат изданию. ogImage сохраняем
-      // в черновике на случай, если понадобится показать пользователю превью.
       ctx.session.shortDraft = { ogImage };
       await ctx.reply("Статья загружена, пишу сценарий...");
       script = await generateShortScript({ input: articleText, isArticle: true });
@@ -267,13 +253,11 @@ async function runShortPipeline(ctx, rawInput) {
     }
   } catch (err) {
     console.error("Ошибка генерации сценария short:", err);
-    await ctx.reply("Не получилось сгенерировать сценарий (Gemini). Попробуй ещё раз через минуту.");
+    await ctx.reply("Не получилось сгенерировать сценарий (Gemini). Попробуй ещё раз.");
     return;
   }
 
-  const preview = script.segments
-    .map((s, i) => `${i + 1}. ${s.narration}`)
-    .join("\n");
+  const preview = script.segments.map((s, i) => `${i + 1}. ${s.narration}`).join("\n");
   await ctx.reply(
     `🎬 «${script.title}» (${script.type === "news" ? "новость" : "история"})\n\n${preview}\n\nСобираю видео — это займёт пару минут...`
   );
@@ -294,24 +278,12 @@ async function runShortPipeline(ctx, rawInput) {
     const { localPath, publicUrl } = await assembleShort(script, {
       onProgress: (msg) => bot.api.sendMessage(chatId, msg),
     });
-    await supabase
-      .from("shorts")
-      .update({ status: "completed", final_video_url: publicUrl })
-      .eq("id", shortRecord.id);
-    await ctx.replyWithVideo(new InputFile(localPath), {
-      caption: `Готово! «${script.title}»\n${publicUrl}`,
-    });
+    await supabase.from("shorts").update({ status: "completed", final_video_url: publicUrl }).eq("id", shortRecord.id);
+    await ctx.replyWithVideo(new InputFile(localPath), { caption: `Готово! «${script.title}»\n${publicUrl}` });
   } catch (err) {
     console.error("Ошибка сборки short:", err);
-    await supabase
-      .from("shorts")
-      .update({ status: "error", error: err.message })
-      .eq("id", shortRecord.id);
-    await ctx.reply(
-      `Не получилось собрать видео: ${err.message}\n\n` +
-      "Проверь, что заданы ключи ELEVENLABS_API_KEY, PEXELS_API_KEY (и/или PIXABAY_API_KEY) в .env, " +
-      "и что на сервере установлен ffmpeg с поддержкой libass."
-    );
+    await supabase.from("shorts").update({ status: "error", error: err.message }).eq("id", shortRecord.id);
+    await ctx.reply(`Не получилось собрать видео: ${err.message}`);
   }
 }
 
@@ -326,10 +298,7 @@ async function askLocationStep(ctx) {
     .text("Своё фото", "loc_photo")
     .row()
     .text("Своё описание", "loc_desc");
-  await ctx.reply(
-    `Локация «${loc.name}»: ${loc.description}\n\nКак задать фон для неё?`,
-    { reply_markup: kb }
-  );
+  await ctx.reply(`Локация «${loc.name}»: ${loc.description}\n\nКак задать фон для неё?`, { reply_markup: kb });
 }
 
 async function askCharacterChoice(ctx) {
@@ -339,10 +308,7 @@ async function askCharacterChoice(ctx) {
     .text("Свои персонажи (пришлю фото)", "chars_own")
     .text("Сгенерировать персонажей", "chars_ai");
   const charList = script.characters.map((c) => c.name).join(", ");
-  await ctx.reply(
-    `Персонажи в сюжете: ${charList}\n\nПерсонажей — свои или сгенерировать?`,
-    { reply_markup: kb }
-  );
+  await ctx.reply(`Персонажи в сюжете: ${charList}\n\nПерсонажей — свои или сгенерировать?`, { reply_markup: kb });
 }
 
 bot.callbackQuery("loc_ai", async (ctx) => {
@@ -360,7 +326,7 @@ bot.callbackQuery("loc_photo", async (ctx) => {
 bot.callbackQuery("loc_desc", async (ctx) => {
   await safeAnswer(ctx);
   ctx.session.step = "awaiting_location_description";
-  await ctx.reply("Опиши локацию своими словами — сгенерирую фон по этому описанию вместо варианта от ИИ.");
+  await ctx.reply("Опиши локацию своими словами — сгенерирую фон по этому описанию.");
 });
 
 bot.callbackQuery("chars_own", async (ctx) => {
@@ -368,10 +334,7 @@ bot.callbackQuery("chars_own", async (ctx) => {
   ctx.session.draft.characters = [];
   await safeAnswer(ctx);
   const names = ctx.session.draft.script.characters.map((c) => c.name).join(", ");
-  await ctx.reply(
-    `Пришли фото персонажа(ей) по одному (${names}). ` +
-    `После каждого фото я покажу кнопки — выберешь, кто это. Когда закончишь — /done.`
-  );
+  await ctx.reply(`Пришли фото персонажа(ей) по одному (${names}). После каждого фото выберешь, кто это. В конце — /done.`);
 });
 
 bot.callbackQuery("chars_ai", async (ctx) => {
@@ -383,11 +346,7 @@ bot.callbackQuery("chars_ai", async (ctx) => {
     await confirmAndEstimateCredits(ctx);
   } catch (err) {
     console.error("Ошибка генерации персонажей:", err);
-    await ctx.reply(
-      "Не получилось сгенерировать персонажей через ИИ — WaveSpeed не ответил. " +
-      "Попробуй `/update_key КЛЮЧ` для обновления токена, либо пришли фото вручную.",
-      { parse_mode: "Markdown" }
-    );
+    await ctx.reply("WaveSpeed не ответил. Попробуй `/update_key` для обновления токена, либо пришли фото вручную.", { parse_mode: "Markdown" });
   }
 });
 
@@ -434,6 +393,7 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
   const idx = parseInt(ctx.callbackQuery.data.split(":")[1], 10);
   const name = ctx.session.draft.script.characters[idx]?.name;
   const pendingPhoto = ctx.session.draft.pendingPhotoUrl;
+  
   if (!name || !pendingPhoto) {
     await ctx.reply("Что-то пошло не так, пришли фото ещё раз.");
     return;
@@ -446,20 +406,14 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
     .filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
 
   if (remaining.length > 0) {
-    await ctx.reply(
-      `Добавлен персонаж "${name}". Осталось: ${remaining.join(", ")}.\n` +
-      `Пришли следующее фото, или /done если персонажей больше нет.`
-    );
+    await ctx.reply(`Добавлен персонаж "${name}". Осталось: ${remaining.join(", ")}.\nПришли следующее фото, или /done.`);
   } else {
     await ctx.reply(`Все персонажи собраны. Можно жать /done.`);
   }
 });
 
 bot.command("done", async (ctx) => {
-  if (ctx.session.step !== "awaiting_character_photos") {
-    await ctx.reply("Если хочешь обновить API ключ — отправь `/update_key КЛЮЧ`.\nЕсли хочешь создать эпизод — отправь /new_episode.", { parse_mode: "Markdown" });
-    return;
-  }
+  if (ctx.session.step !== "awaiting_character_photos") return;
 
   const scriptCharacters = ctx.session.draft.script.characters;
   const haveNames = ctx.session.draft.characters.map((c) => c.name);
@@ -471,12 +425,10 @@ bot.command("done", async (ctx) => {
       const generated = await generateCharacterImages(missing);
       ctx.session.draft.characters.push(...generated);
     } catch (err) {
-      console.error("Ошибка генерации недостающих персонажей:", err);
       await ctx.reply("WaveSpeed не ответил. Пришли фото для оставшихся вручную.");
       return;
     }
   }
-
   await confirmAndEstimateCredits(ctx);
 });
 
@@ -495,11 +447,7 @@ async function confirmAndEstimateCredits(ctx) {
     });
 
     let balance = null;
-    try {
-      balance = await checkBalance();
-    } catch (err) {
-      console.log(`Не удалось проверить баланс WaveSpeed: ${err.message}`);
-    }
+    try { balance = await checkBalance(); } catch (err) {}
 
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
@@ -507,10 +455,7 @@ async function confirmAndEstimateCredits(ctx) {
     let balanceLine = "";
     if (balance !== null) {
       balanceLine = `\nБаланс WaveSpeed: $${balance.toFixed(2)}.`;
-      if (balance < estimatedCost) {
-        balanceLine +=
-          `\n⚠️ Баланса может не хватить на весь эпизод. Воспользуйся \`/update_key КЛЮЧ\` для смены аккаунта.`;
-      }
+      if (balance < estimatedCost) balanceLine += `\n⚠️ Баланса может не хватить на весь эпизод. Воспользуйся \`/update_key\` для смены аккаунта.`;
     }
 
     await ctx.reply(
@@ -519,7 +464,6 @@ async function confirmAndEstimateCredits(ctx) {
       { reply_markup: kb, parse_mode: "Markdown" }
     );
   } catch (err) {
-    console.error("Ошибка в confirmAndEstimateCredits:", err);
     await ctx.reply("Что-то пошло не так при подсчёте. Попробуй /new_episode заново.");
   }
 }
@@ -561,20 +505,14 @@ async function processEpisode(ctx, episode) {
     for (const loc of missingLocations) {
       try {
         loc.image_url = await generateLocationImage(loc.description);
-      } catch (err) {
-        console.log(`Не удалось сгенерировать фон локации "${loc.name}", сцены пойдут без фиксированного фона`);
-      }
+      } catch (err) {}
     }
     await supabase.from("episodes").update({ locations }).eq("id", episode.id);
   }
   const locationByName = new Map(locations.map((l) => [l.name, l]));
 
-  const { data: existingScenes } = await supabase
-    .from("scenes")
-    .select("*")
-    .eq("episode_id", episode.id);
+  const { data: existingScenes } = await supabase.from("scenes").select("*").eq("episode_id", episode.id);
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
-
   let voiceoverFailWarned = false;
 
   try {
@@ -602,31 +540,16 @@ async function processEpisode(ctx, episode) {
 
         const { data: newScene } = await supabase
           .from("scenes")
-          .insert({
-            episode_id: episode.id,
-            scene_number: sceneNumber,
-            prompt: scene.action_prompt,
-            status: "pending",
-            reference_image_url: referenceImageUrl,
-          })
-          .select()
-          .single();
+          .insert({ episode_id: episode.id, scene_number: sceneNumber, prompt: scene.action_prompt, status: "pending", reference_image_url: referenceImageUrl })
+          .select().single();
         record = newScene;
 
-        const charRefs = (scene.character_names || [])
-          .map((n) => characters.find((c) => c.name === n)?.ref_image_url)
-          .filter(Boolean);
+        const charRefs = (scene.character_names || []).map((n) => characters.find((c) => c.name === n)?.ref_image_url).filter(Boolean);
 
         const taskId = await generateVideoScene(
-          scene.action_prompt,
-          charRefs,
-          record.reference_image_url || undefined,
-          "Minecraft-style, blocky, low texture, vibrant colors"
+          scene.action_prompt, charRefs, record.reference_image_url || undefined, "Minecraft-style, blocky, low texture, vibrant colors"
         );
-        await supabase
-          .from("scenes")
-          .update({ task_id: taskId, status: "processing" })
-          .eq("id", record.id);
+        await supabase.from("scenes").update({ task_id: taskId, status: "processing" }).eq("id", record.id);
         record.task_id = taskId;
         record.status = "processing";
       }
@@ -634,10 +557,11 @@ async function processEpisode(ctx, episode) {
       if (scene.voiceover_text && !record.voiceover_audio_url) {
         try {
           const speakerName = (scene.character_names || [])[0] || scene.primary_character || null;
-          const speakerDescription = speakerName
-            ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description
-            : null;
+          const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
+          
+          // ТУТ ОТРАБОТАЕТ БРАУЗЕРНЫЙ ОБХОД, ЕСЛИ API ЛЕЖИТ
           const audioUrl = await generateVoiceover(scene.voiceover_text, speakerName, speakerDescription);
+          
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
         } catch (err) {
@@ -649,7 +573,6 @@ async function processEpisode(ctx, episode) {
         }
       }
     }
-
     await pollScenes(ctx, episode.id);
 
   } catch (error) {
@@ -665,22 +588,16 @@ async function pollScenes(ctx, episodeId) {
 
   while (!isDone) {
     await new Promise((res) => setTimeout(res, 30_000));
-    const { data: scenes } = await supabase
-      .from("scenes")
-      .select("*")
-      .eq("episode_id", episodeId);
-
+    const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
     const pending = scenes.filter((s) => s.status === "processing" || s.status === "pending");
 
     if (pending.length === 0) {
       isDone = true;
       const allSuccess = scenes.every((s) => s.status === "completed" && s.video_url);
 
-      if (!allSuccess) {
-         if (!compositeWarned) {
-             await ctx.reply("Некоторые сцены не удалось сгенерировать. Собираю эпизод из того, что получилось.");
-             compositeWarned = true;
-         }
+      if (!allSuccess && !compositeWarned) {
+         await ctx.reply("Некоторые сцены не удалось сгенерировать. Собираю эпизод из того, что получилось.");
+         compositeWarned = true;
       }
 
       const validScenes = scenes.filter(s => s.status === "completed" && s.video_url).sort((a, b) => a.scene_number - b.scene_number);
@@ -699,7 +616,7 @@ async function pollScenes(ctx, episodeId) {
       } catch (err) {
         console.error("Ошибка сборки:", err);
         await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
-        await ctx.reply("Видео готовы, но не получилось собрать их вместе (FFmpeg). Попробуй /replay позже.");
+        await ctx.reply("Видео готовы, но не получилось собрать (FFmpeg). Попробуй /replay позже.");
       }
     } else {
       for (const scene of pending) {
@@ -707,16 +624,10 @@ async function pollScenes(ctx, episodeId) {
         try {
           const status = await checkVideoStatus(scene.task_id);
           if (status.status === "COMPLETED") {
-            await supabase
-              .from("scenes")
-              .update({ status: "completed", video_url: status.video_url })
-              .eq("id", scene.id);
+            await supabase.from("scenes").update({ status: "completed", video_url: status.video_url }).eq("id", scene.id);
             await ctx.reply(`✅ Сцена ${scene.scene_number} готова!`);
           } else if (status.status === "FAILED") {
-            await supabase
-              .from("scenes")
-            .update({ status: "failed" })
-              .eq("id", scene.id);
+            await supabase.from("scenes").update({ status: "failed" }).eq("id", scene.id);
             await ctx.reply(`❌ Ошибка генерации сцены ${scene.scene_number}.`);
           }
         } catch (err) {
@@ -728,32 +639,20 @@ async function pollScenes(ctx, episodeId) {
 }
 
 function formatScriptPreview(script) {
-  return script.scenes
-    .map(
-      (s, i) =>
-        `**Сцена ${i + 1}**: ${s.action_prompt}\n` +
-        `   Локация: ${s.location_name}\n` +
-        `   Персонажи: ${(s.character_names || []).join(", ")}\n`
-    )
-    .join("\n");
+  return script.scenes.map((s, i) => `**Сцена ${i + 1}**: ${s.action_prompt}\n   Локация: ${s.location_name}\n   Персонажи: ${(s.character_names || []).join(", ")}\n`).join("\n");
 }
 
 await ensureBucket();
-
 const app = express();
-
 app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
 app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
 
 bot.catch((err) => {
   console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
-  err.ctx.reply("Произошла ошибка при обработке. Попробуй ещё раз или начни заново с /new_episode.").catch(() => {});
 });
 
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled rejection:", err);
-});
+process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
