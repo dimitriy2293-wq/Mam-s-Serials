@@ -10,15 +10,18 @@ import {
   generateSceneReferenceImage,
   generateLocationImage,
   generateVideoScene,
-  generateVoiceover,
   checkVideoStatus,
   checkBalance,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
 } from "./lib/wavespeed.js";
+// Озвучка сериала — через ElevenLabs (сам определяет язык/голос), см. lib/elevenlabs.js
+import { generateVoiceover } from "./lib/elevenlabs.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
+import { isUrl, fetchArticle, generateShortScript } from "./lib/shorts-script.js";
+import { assembleShort } from "./lib/shorts-assemble.js";
 
 // Настройка путей
 const __filename = fileURLToPath(import.meta.url);
@@ -45,18 +48,18 @@ bot.use(session({
 // ---------- /start ----------
 bot.command("start", async (ctx) => {
   await ctx.reply(
-    "Привет! Я создаю короткие AI-сериалы по твоему сюжету.\n\n" +
-    "Нажми /new_episode чтобы начать новый эпизод.\n" +
-    "Команды для ключей:\n" +
-    "`/update_key <твой_ключ>` — обновить ключ вручную.\n" +
-    "`/base_key` — пополнить базу запасных ключей.\n" +
-    "Если генерация упадёт с ошибкой — /replay продолжит с места остановки.",
+    "Привет! Я создаю короткие AI-сериалы по твоему сюжету, а ещё умею делать короткие TikTok-style видео.\n\n" +
+    "Нажми /new_episode чтобы начать новый эпизод сериала.\n" +
+    "Нажми /new_short чтобы сделать короткое видео (30-40 сек) по ссылке на статью или по теме.\n" +
+    "Команда `/update_key <твой_ключ>` — обновить API ключ WaveSpeed.\n" +
+    "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось.",
     { parse_mode: "Markdown" }
   );
 });
 
 // ---------- ОБНОВЛЕНИЕ КЛЮЧА (ЧЕРЕЗ RENDER API) ----------
 bot.command("update_key", async (ctx) => {
+  // Получаем ключ из текста сообщения после команды
   const newKey = ctx.match ? ctx.match.trim() : "";
 
   if (!newKey) {
@@ -70,10 +73,12 @@ bot.command("update_key", async (ctx) => {
   const serviceId = process.env.RENDER_SERVICE_ID; 
 
   if (!renderApiKey || !serviceId) {
-    return ctx.reply("❌ В `process.env` не найдены `RENDER_API_KEY` или `RENDER_SERVICE_ID`!");
+    return ctx.reply(
+      "❌ В `process.env` не найдены `RENDER_API_KEY` или `RENDER_SERVICE_ID`!\nПроверь их наличие во вкладке Environment на Render."
+    );
   }
 
-  const statusMsg = await ctx.reply("⏳ Отправляю запрос в Render API...");
+  const statusMsg = await ctx.reply("⏳ Отправляю запрос в Render API для обновления `WAVESPEED_API_KEY`...");
 
   try {
     const response = await fetch(`https://api.render.com/v1/services/${serviceId}/env-vars/WAVESPEED_API_KEY`, {
@@ -83,65 +88,41 @@ bot.command("update_key", async (ctx) => {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${renderApiKey}`
       },
-      body: JSON.stringify({ value: newKey })
+      body: JSON.stringify({
+        value: newKey
+      })
     });
 
     if (response.ok) {
       await ctx.api.editMessageText(
-        ctx.chat.id, statusMsg.message_id,
-        "✅ **Ключ успешно обновлен в Render!**\n\n🔄 Бот ушел на перезагрузку (около 1 минуты).",
+        ctx.chat.id,
+        statusMsg.message_id,
+        "✅ **Ключ WAVESPEED_API_KEY успешно обновлен в Render!**\n\n🔄 Бот автоматически перезапускается с новым ключом (это займет около 1 минуты).",
         { parse_mode: "Markdown" }
       );
     } else {
       const errorData = await response.json().catch(() => ({ message: response.statusText }));
-      await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `❌ **Ошибка Render API:** ${errorData.message}`);
+      console.error("Render API error:", errorData);
+      
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        `❌ **Ошибка Render API (${response.status}):** ${errorData.message || response.statusText}`
+      );
     }
   } catch (error) {
-    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, "❌ Произошла ошибка при соединении с сервером Render.");
+    console.error("Fetch error:", error);
+    await ctx.api.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      "❌ Произошла ошибка при соединении с сервером Render."
+    );
   }
 });
 
-// ---------- БАЗА ЗАПАСНЫХ КЛЮЧЕЙ ----------
-bot.command("base_key", async (ctx) => {
-  ctx.session.step = "awaiting_wavespeed_keys";
-  await ctx.reply(
-    "📥 **Режим пополнения базы ключей включен.**\n\n" +
-    "Отправляй мне ключи по одному (каждый ключ — отдельным сообщением).\n" +
-    "Я буду сохранять их в Supabase.\n\n" +
-    "Команды:\n" +
-    "/cancel — удалить последний добавленный ключ\n" +
-    "/done_keys — выйти из режима пополнения базы",
-    { parse_mode: "Markdown" }
-  );
-});
-
-bot.command("cancel", async (ctx) => {
-  const { data, error } = await supabase
-    .from("wavespeed_keys")
-    .select("id, key")
-    .order("created_at", { ascending: false })
-    .limit(1);
-
-  if (data && data.length > 0) {
-    await supabase.from("wavespeed_keys").delete().eq("id", data[0].id);
-    await ctx.reply(`🗑️ Удалил из базы последний ключ:\n<code>${data[0].key}</code>`, { parse_mode: "HTML" });
-  } else {
-    await ctx.reply("В базе пусто, удалять нечего.");
-  }
-});
-
-bot.command("done_keys", async (ctx) => {
-  if (ctx.session.step === "awaiting_wavespeed_keys") {
-    ctx.session.step = null;
-    const { count } = await supabase.from("wavespeed_keys").select("*", { count: 'exact', head: true });
-    await ctx.reply(`✅ Вышли из режима. Всего ключей в базе: ${count || 0}.`);
-  } else {
-    await ctx.reply("Ты и не был в режиме добавления ключей.");
-  }
-});
-
+// ---------- /finish_key (Заглушка) ----------
 bot.command("finish_key", async (ctx) => {
-  await ctx.reply("Команда отключена. Используй `/update_key` или `/base_key`.", { parse_mode: "Markdown" });
+  await ctx.reply("Автоматический забор ключа отключен. Используй команду `/update_key ТВОЙ_КЛЮЧ`.", { parse_mode: "Markdown" });
 });
 
 // ---------- /replay ----------
@@ -164,6 +145,7 @@ bot.command("replay", async (ctx) => {
   await supabase.from("episodes").update({ status: "processing" }).eq("id", episode.id);
 
   processEpisode(ctx, episode).catch((err) => {
+    console.error("Необработанная ошибка в processEpisode (replay):", err);
     ctx.reply("Опять что-то пошло не так. Можешь попробовать /replay ещё раз.").catch(() => {});
   });
 });
@@ -193,26 +175,22 @@ bot.callbackQuery("draft_no", async (ctx) => {
   await ctx.reply("Опиши тему/жанр для сериала (например: 'комедия про аэропорт').");
 });
 
+// ---------- /new_short — короткое TikTok-style видео ----------
+bot.command("new_short", async (ctx) => {
+  ctx.session.step = "awaiting_short_input";
+  ctx.session.shortDraft = {};
+  await ctx.reply(
+    "Пришли ссылку на статью, или просто опиши тему/идею для короткого видео (30-40 сек).\n\n" +
+    "Если это похоже на реальную новость — сделаю пересказ по фактам, если это творческая идея — придумаю историю.\n\n" +
+    "Голос — русский (ElevenLabs), субтитры слово-за-словом, видео/фото со стоков (Pexels/Pixabay)."
+  );
+});
+
 // ---------- Текстовые сообщения ----------
 bot.on("message:text", async (ctx, next) => {
   if (ctx.message.text.startsWith("/")) return next();
 
   const step = ctx.session.step;
-
-  // ОБРАБОТКА ДОБАВЛЕНИЯ КЛЮЧЕЙ
-  if (step === "awaiting_wavespeed_keys") {
-    const newKey = ctx.message.text.trim();
-    const { error } = await supabase.from("wavespeed_keys").insert({ key: newKey });
-    
-    if (error) {
-      console.error("Ошибка добавления ключа:", error);
-      await ctx.reply("❌ Ошибка сохранения в базу. Проверь создана ли таблица wavespeed_keys.");
-    } else {
-      const { count } = await supabase.from("wavespeed_keys").select("*", { count: 'exact', head: true });
-      await ctx.reply(`✅ Ключ сохранён! (Всего в базе: ${count})\nШли следующий, либо /cancel (удалить), либо /done_keys (выйти).`);
-    }
-    return;
-  }
 
   if (step === "awaiting_draft_text" || step === "awaiting_theme") {
     const isDraft = step === "awaiting_draft_text";
@@ -252,7 +230,90 @@ bot.on("message:text", async (ctx, next) => {
     await askLocationStep(ctx);
     return;
   }
+
+  if (step === "awaiting_short_input") {
+    ctx.session.step = null; // сбрасываем сразу, чтобы /new_short можно было запустить заново, не дожидаясь конца сборки
+    await runShortPipeline(ctx, ctx.message.text.trim());
+    return;
+  }
 });
+
+// ---------- Пайплайн генерации короткого видео (TikTok-style) ----------
+async function runShortPipeline(ctx, rawInput) {
+  const chatId = ctx.chat.id;
+  let script;
+
+  try {
+    if (isUrl(rawInput)) {
+      await ctx.reply("Загружаю статью по ссылке...");
+      const { text: articleText, ogImage } = await fetchArticle(rawInput);
+      if (!articleText || articleText.length < 200) {
+        await ctx.reply(
+          "Не получилось вытащить достаточно текста со страницы (возможно, сайт блокирует ботов). " +
+          "Пришли текст статьи или тему сообщением вместо ссылки."
+        );
+        return;
+      }
+      // Примечание: og:image статьи НЕ используется в сборке ролика — фото со стоков
+      // (Pexels/Pixabay) безопаснее в плане авторских прав, чем изображения из
+      // конкретной статьи, которые обычно принадлежат изданию. ogImage сохраняем
+      // в черновике на случай, если понадобится показать пользователю превью.
+      ctx.session.shortDraft = { ogImage };
+      await ctx.reply("Статья загружена, пишу сценарий...");
+      script = await generateShortScript({ input: articleText, isArticle: true });
+    } else {
+      await ctx.reply("Пишу сценарий...");
+      script = await generateShortScript({ input: rawInput, isArticle: false });
+    }
+  } catch (err) {
+    console.error("Ошибка генерации сценария short:", err);
+    await ctx.reply("Не получилось сгенерировать сценарий (Gemini). Попробуй ещё раз через минуту.");
+    return;
+  }
+
+  const preview = script.segments
+    .map((s, i) => `${i + 1}. ${s.narration}`)
+    .join("\n");
+  await ctx.reply(
+    `🎬 «${script.title}» (${script.type === "news" ? "новость" : "история"})\n\n${preview}\n\nСобираю видео — это займёт пару минут...`
+  );
+
+  const { data: shortRecord } = await supabase
+    .from("shorts")
+    .insert({
+      telegram_id: ctx.from.id,
+      title: script.title,
+      type: script.type,
+      script,
+      status: "processing",
+    })
+    .select()
+    .single();
+
+  try {
+    const { localPath, publicUrl } = await assembleShort(script, {
+      onProgress: (msg) => bot.api.sendMessage(chatId, msg),
+    });
+    await supabase
+      .from("shorts")
+      .update({ status: "completed", final_video_url: publicUrl })
+      .eq("id", shortRecord.id);
+    await ctx.replyWithVideo(new InputFile(localPath), {
+      caption: `Готово! «${script.title}»\n${publicUrl}`,
+    });
+  } catch (err) {
+    console.error("Ошибка сборки short:", err);
+    await supabase
+      .from("shorts")
+      .update({ status: "error", error: err.message })
+      .eq("id", shortRecord.id);
+    await ctx.reply(
+      `Не получилось собрать видео: ${err.message}\n\n` +
+      "Проверь, что заданы ключи ELEVENLABS_API_KEY, PEXELS_API_KEY (и/или PIXABAY_API_KEY) в .env, " +
+      "и что на сервере установлен ffmpeg с поддержкой libass."
+    );
+  }
+}
 
 async function askLocationStep(ctx) {
   const { locations, locationQueueIndex } = ctx.session.draft;
@@ -396,7 +457,7 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
 
 bot.command("done", async (ctx) => {
   if (ctx.session.step !== "awaiting_character_photos") {
-    await ctx.reply("Если хочешь пополнить базу ключей — `/base_key`.\nЕсли хочешь создать эпизод — `/new_episode`.", { parse_mode: "Markdown" });
+    await ctx.reply("Если хочешь обновить API ключ — отправь `/update_key КЛЮЧ`.\nЕсли хочешь создать эпизод — отправь /new_episode.", { parse_mode: "Markdown" });
     return;
   }
 
@@ -419,7 +480,6 @@ bot.command("done", async (ctx) => {
   await confirmAndEstimateCredits(ctx);
 });
 
-// ---------- АВТО-ЗАМЕНА КЛЮЧЕЙ И ОЦЕНКА ----------
 async function confirmAndEstimateCredits(ctx) {
   try {
     const scenes = ctx.session.draft.script.scenes;
@@ -441,52 +501,17 @@ async function confirmAndEstimateCredits(ctx) {
       console.log(`Не удалось проверить баланс WaveSpeed: ${err.message}`);
     }
 
-    if (balance !== null && balance < estimatedCost) {
-      // БАЛАНСА НЕ ХВАТАЕТ - ИЩЕМ НОВЫЙ КЛЮЧ
-      await ctx.reply(`⚠️ Баланса ($${balance.toFixed(2)}) не хватит на весь эпизод (нужно ~$${estimatedCost.toFixed(2)}).\n\n🔄 Забираю запасной ключ из базы...`);
-      
-      const { data: keys } = await supabase
-        .from("wavespeed_keys")
-        .select("*")
-        .order("created_at", { ascending: true }) // Берем самый старый закинутый
-        .limit(1);
-
-      if (!keys || keys.length === 0) {
-         await ctx.reply("❌ В базе закончились запасные ключи! Пополни базу через команду `/base_key`, а затем снова нажми `/done`.", { parse_mode: "Markdown" });
-         return; // Стопаем генерацию
-      }
-
-      const nextKey = keys[0].key;
-      // Удаляем этот ключ из базы, чтобы не использовать дважды
-      await supabase.from("wavespeed_keys").delete().eq("id", keys[0].id);
-
-      const renderApiKey = process.env.RENDER_API_KEY;
-      const serviceId = process.env.RENDER_SERVICE_ID;
-
-      await ctx.reply("⏳ Нашел ключ! Передаю его в Render... Бот уйдет на перезагрузку (это займет около 1 минуты).\n\n**Важно:** Твои данные сохранены. Подожди 1 минуту и просто снова нажми `/done`!", { parse_mode: "Markdown" });
-
-      try {
-          await fetch(`https://api.render.com/v1/services/${serviceId}/env-vars/WAVESPEED_API_KEY`, {
-            method: "PUT",
-            headers: {
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${renderApiKey}`
-            },
-            body: JSON.stringify({ value: nextKey })
-          });
-      } catch (err) {
-          console.error(err);
-          await ctx.reply("Ошибка при связи с Render API.");
-      }
-      return; // Завершаем выполнение, так как Render сейчас перезагрузит бота
-    }
-
-    // ЕСЛИ ДЕНЕГ ХВАТАЕТ ИЛИ ПРОВЕРИТЬ НЕ УДАЛОСЬ
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
-    let balanceLine = balance !== null ? `\nБаланс WaveSpeed: $${balance.toFixed(2)}.` : "";
+    let balanceLine = "";
+    if (balance !== null) {
+      balanceLine = `\nБаланс WaveSpeed: $${balance.toFixed(2)}.`;
+      if (balance < estimatedCost) {
+        balanceLine +=
+          `\n⚠️ Баланса может не хватить на весь эпизод. Воспользуйся \`/update_key КЛЮЧ\` для смены аккаунта.`;
+      }
+    }
 
     await ctx.reply(
       `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
@@ -606,11 +631,15 @@ async function processEpisode(ctx, episode) {
         record.status = "processing";
       }
 
-      if (scene.voiceover_text && !record.audio_url) {
+      if (scene.voiceover_text && !record.voiceover_audio_url) {
         try {
-          const audioUrl = await generateVoiceover(scene.voiceover_text, scene.voiceover_gender || "M");
-          await supabase.from("scenes").update({ audio_url: audioUrl }).eq("id", record.id);
-          record.audio_url = audioUrl;
+          const speakerName = (scene.character_names || [])[0] || scene.primary_character || null;
+          const speakerDescription = speakerName
+            ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description
+            : null;
+          const audioUrl = await generateVoiceover(scene.voiceover_text, speakerName, speakerDescription);
+          await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
+          record.voiceover_audio_url = audioUrl;
         } catch (err) {
           console.error(`Ошибка озвучки (Сцена ${sceneNumber}):`, err.message);
           if (!voiceoverFailWarned) {

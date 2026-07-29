@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Устанавливаем нужные пакеты
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    fonts-dejavu-core \
     xvfb \
     x11vnc \
     novnc \

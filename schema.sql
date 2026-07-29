@@ -30,3 +30,17 @@ create table bot_sessions (
   data jsonb not null,
   updated_at timestamptz not null default now()
 );
+
+create table shorts (
+  id uuid primary key default gen_random_uuid(),
+  telegram_id bigint not null,
+  title text,
+  type text, -- 'news' | 'story'
+  script jsonb not null,
+  status text not null default 'processing', -- processing | completed | error
+  final_video_url text,
+  error text,
+  created_at timestamptz not null default now()
+);
+
+create index shorts_telegram_id_idx on shorts(telegram_id);
