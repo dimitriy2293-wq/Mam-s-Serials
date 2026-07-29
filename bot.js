@@ -277,6 +277,12 @@ async function runShortPipeline(ctx, rawInput) {
   try {
     const { localPath, publicUrl } = await assembleShort(script, {
       onProgress: (msg) => bot.api.sendMessage(chatId, msg),
+      // ДОБАВЛЕНО: Передаем функцию для отправки скриншота, если браузер упадет внутри assembleShort
+      onBrowserError: async (buffer, errorMsg) => {
+        await ctx.replyWithPhoto(new InputFile(buffer), {
+          caption: `🚨 Ошибка в невидимом браузере! Вот что он видит:\n\n${errorMsg}`
+        });
+      }
     });
     await supabase.from("shorts").update({ status: "completed", final_video_url: publicUrl }).eq("id", shortRecord.id);
     await ctx.replyWithVideo(new InputFile(localPath), { caption: `Готово! «${script.title}»\n${publicUrl}` });
@@ -559,8 +565,8 @@ async function processEpisode(ctx, episode) {
           const speakerName = (scene.character_names || [])[0] || scene.primary_character || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
           
-          // ТУТ ОТРАБОТАЕТ БРАУЗЕРНЫЙ ОБХОД, ЕСЛИ API ЛЕЖИТ
-          const audioUrl = await generateVoiceover(scene.voiceover_text, speakerName, speakerDescription);
+          // ДОБАВЛЕНО: Передаем ctx внутрь generateVoiceover, чтобы внутри можно было отправить скриншот
+          const audioUrl = await generateVoiceover(scene.voiceover_text, speakerName, speakerDescription, ctx);
           
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
