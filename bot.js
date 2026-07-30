@@ -124,18 +124,39 @@ bot.command("finish_key", async (ctx) => {
 });
 
 // ---------- /replay ----------
+// Универсальное продолжение последней незавершённой работы:
+// 1) сначала пытаемся продолжить short;
+// 2) если short нет — продолжаем сериал.
 bot.command("replay", async (ctx) => {
+  const telegramId = ctx.from.id;
+
+  const { data: short, error: shortError } = await supabase
+    .from("shorts")
+    .select("*")
+    .eq("telegram_id", telegramId)
+    .in("status", ["error", "processing", "awaiting_voice"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (shortError) console.error("Ошибка поиска short для /replay:", shortError);
+
+  if (short) {
+    await resumeShortFromReplay(ctx, short);
+    return;
+  }
+
   const { data: episode, error } = await supabase
     .from("episodes")
     .select("*")
-    .eq("telegram_id", ctx.from.id)
+    .eq("telegram_id", telegramId)
     .eq("status", "error")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (error || !episode) {
-    await ctx.reply("Не получилось найти эпизод для повтора. Попробуй ещё раз.");
+    await ctx.reply("Не получилось найти незавершённую задачу для повтора. Попробуй /new_short или /new_episode.");
     return;
   }
 
@@ -144,9 +165,61 @@ bot.command("replay", async (ctx) => {
 
   processEpisode(ctx, episode).catch((err) => {
     console.error("Необработанная ошибка в processEpisode (replay):", err);
-    ctx.reply("Опять что-то пошло не так. Можешь попробовать /replay ещё раз.").catch(() => {});
+    ctx.reply("Опять что-то пошло не так. Нажми /replay ещё раз.").catch(() => {});
   });
 });
+
+async function resumeShortFromReplay(ctx, short) {
+  try {
+    if (short.status === "awaiting_voice" || !short.voiceover_audio_url) {
+      ctx.session.shortDraft = { shortId: short.id, script: short.script };
+      ctx.session.step = "awaiting_short_voice";
+      await ctx.reply(
+        `🔄 Продолжаю TikTok «${short.title || "без названия"}».\n\n` +
+        `Озвучка ещё не получена. Пришли сюда готовый MP3, WAV, M4A, OGG или AAC — и я продолжу сборку с этого места.`
+      );
+      return;
+    }
+
+    ctx.session.shortDraft = { shortId: short.id, script: short.script };
+    ctx.session.step = "awaiting_short_voice";
+    await supabase.from("shorts").update({ status: "processing", error: null }).eq("id", short.id);
+    await ctx.reply(`🔄 Возобновляю сборку TikTok «${short.title || "без названия"}» с сохранённой озвучкой...`);
+
+    await assembleShortForTelegram(ctx, short.id, short.script, short.voiceover_audio_url);
+  } catch (err) {
+    console.error("Ошибка /replay для short:", err);
+    await supabase.from("shorts").update({ status: "error", error: err.message }).eq("id", short.id);
+    await ctx.reply(`❌ Не удалось продолжить TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`);
+  }
+}
+
+async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl) {
+  const { localPath: finalPath, publicUrl, totalDurationSec } = await assembleShort(script, {
+    voiceoverUrl,
+    onProgress: (msg) => bot.api.sendMessage(ctx.chat.id, msg),
+  });
+
+  const { error } = await supabase
+    .from("shorts")
+    .update({ status: "completed", final_video_url: publicUrl, error: null })
+    .eq("id", shortId);
+  if (error) console.error("Не удалось обновить completed short:", error);
+
+  ctx.session.step = null;
+  ctx.session.shortDraft = {};
+
+  await ctx.replyWithVideo(new InputFile(finalPath), {
+    caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
+  });
+
+  // После отправки видео удаляем временную папку сборки, чтобы Render не забивал диск.
+  try {
+    fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
+  } catch (cleanupError) {
+    console.warn("Не удалось очистить временные файлы short:", cleanupError.message);
+  }
+}
 
 // ---------- /new_episode ----------
 bot.command("new_episode", async (ctx) => {
@@ -217,8 +290,18 @@ async function handleShortVoiceUpload(ctx) {
   try {
     await ctx.reply("🎙️ Озвучка получена! Скачиваю файл и начинаю сборку...");
 
-    const file = await ctx.getFile();
-    await file.download(localPath);
+    // В grammY File нет метода download(). Скачиваем файл через Telegram Bot API.
+    const file = await ctx.api.getFile(message.audio?.file_id || message.document?.file_id);
+    if (!file.file_path) throw new Error("Telegram не вернул путь к файлу озвучки.");
+
+    const telegramFileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const response = await fetch(telegramFileUrl);
+    if (!response.ok) {
+      throw new Error(`Не удалось скачать озвучку из Telegram: HTTP ${response.status}`);
+    }
+    const audioBuffer = Buffer.from(await response.arrayBuffer());
+    if (!audioBuffer.length) throw new Error("Telegram вернул пустой файл озвучки.");
+    fs.writeFileSync(localPath, audioBuffer);
 
     const voiceoverUrl = await uploadToStorage(localPath, "short-voiceovers");
 
@@ -233,31 +316,7 @@ async function handleShortVoiceUpload(ctx) {
     if (updateError) throw new Error(`Не удалось сохранить озвучку: ${updateError.message}`);
 
     await ctx.reply("🎬 Начинаю монтаж. Это может занять несколько минут...");
-
-    const { localPath: finalPath, publicUrl, totalDurationSec } = await assembleShort(script, {
-      voiceoverUrl,
-      onProgress: (msg) => bot.api.sendMessage(ctx.chat.id, msg),
-    });
-
-    const { error: completeError } = await supabase
-      .from("shorts")
-      .update({
-        status: "completed",
-        final_video_url: publicUrl,
-        error: null,
-      })
-      .eq("id", shortId);
-
-    if (completeError) {
-      console.error("Не удалось обновить статус short:", completeError);
-    }
-
-    ctx.session.step = null;
-    ctx.session.shortDraft = {};
-
-    await ctx.replyWithVideo(new InputFile(finalPath), {
-      caption: `✅ Готово! TikTok собран полностью.\\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
-    });
+    await assembleShortForTelegram(ctx, shortId, script, voiceoverUrl);
 
     return true;
   } catch (err) {
@@ -269,8 +328,8 @@ async function handleShortVoiceUpload(ctx) {
       .eq("id", shortId);
 
     await ctx.reply(
-      `❌ Не удалось собрать TikTok.\\n\\n` +
-      `${err.message}\\n\\n` +
+      `❌ Не удалось собрать TikTok.\n\n` +
+      `${err.message}\n\n` +
       `Можешь отправить другую озвучку — я попробую собрать ролик заново.`
     );
     return true;
