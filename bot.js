@@ -253,13 +253,18 @@ async function runShortPipeline(ctx, rawInput) {
     }
   } catch (err) {
     console.error("Ошибка генерации сценария short:", err);
-    await ctx.reply("Не получилось сгенерировать сценарий (Gemini). Попробуй ещё раз.");
+    await ctx.reply("Не получилось сгенерировать сценарий. Попробуй ещё раз.");
     return;
   }
 
-  const preview = script.segments.map((s, i) => `${i + 1}. ${s.narration}`).join("\n");
+  // Склеиваем сценарий в один чистый текст без цифр
+  const cleanScript = script.segments.map(s => s.narration).join(" ");
+
   await ctx.reply(
-    `🎬 «${script.title}» (${script.type === "news" ? "новость" : "история"})\n\n${preview}\n\nСобираю видео — это займёт пару минут...`
+    `🎬 **Сценарий готов!**\n\n` +
+    `${cleanScript}\n\n` +
+    `🔗 [Сделать озвучку в ElevenLabs](https://elevenlabs.io/app/speech-synthesis)\n\n` +
+    `⏳ Собираю видеоряд (визуал + музыка)...`
   );
 
   const { data: shortRecord } = await supabase
@@ -276,20 +281,15 @@ async function runShortPipeline(ctx, rawInput) {
 
   try {
     const { localPath, publicUrl } = await assembleShort(script, {
-      onProgress: (msg) => bot.api.sendMessage(chatId, msg),
-      // ДОБАВЛЕНО: Передаем функцию для отправки скриншота, если браузер упадет внутри assembleShort
-      onBrowserError: async (buffer, errorMsg) => {
-        await ctx.replyWithPhoto(new InputFile(buffer), {
-          caption: `🚨 Ошибка в невидимом браузере! Вот что он видит:\n\n${errorMsg}`
-        });
-      }
+      onProgress: (msg) => bot.api.sendMessage(chatId, msg)
     });
+    
     await supabase.from("shorts").update({ status: "completed", final_video_url: publicUrl }).eq("id", shortRecord.id);
-    await ctx.replyWithVideo(new InputFile(localPath), { caption: `Готово! «${script.title}»\n${publicUrl}` });
+    await ctx.replyWithVideo(new InputFile(localPath), { caption: `✅ Визуал готов! Накладывай голос из ElevenLabs и заливай.` });
   } catch (err) {
     console.error("Ошибка сборки short:", err);
     await supabase.from("shorts").update({ status: "error", error: err.message }).eq("id", shortRecord.id);
-    await ctx.reply(`Не получилось собрать видео: ${err.message}`);
+    await ctx.reply(`❌ Не получилось собрать видео: ${err.message}`);
   }
 }
 
