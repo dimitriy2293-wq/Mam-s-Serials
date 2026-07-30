@@ -72,7 +72,7 @@ bot.use(async (ctx, next) => {
 // может держать/перезапускать несколько процессов. Поэтому лок хранится в Supabase и
 // берётся ОДНИМ атомарным UPDATE: строка обновляется, только если лока ещё нет —
 // Postgres гарантирует, что при двух одновременных запросах выиграет только один.
-const BUILD_LOCK_STALE_MS = 10 * 60 * 1000; // если сборка "висит" дольше 10 минут — считаем её зависшей
+const BUILD_LOCK_STALE_MS = 15 * 60 * 1000; // если сборка "висит" дольше 15 минут — считаем её зависшей
 
 async function acquireShortBuildLock(shortId) {
   const staleThreshold = new Date(Date.now() - BUILD_LOCK_STALE_MS).toISOString();
@@ -82,7 +82,7 @@ async function acquireShortBuildLock(shortId) {
     .update({
       status: "error",
       build_lock: false,
-      error: "Сборка зависла (дольше 10 минут) и была сброшена автоматически. Нажми /replay.",
+      error: "Сборка зависла (дольше 15 минут) и была сброшена автоматически. Нажми /replay.",
     })
     .eq("id", shortId)
     .eq("build_lock", true)
@@ -256,7 +256,7 @@ async function resumeShortFromReplay(ctx, short) {
     }
 
     // Важно: НЕ выходим здесь только потому, что status === "building". Сброс
-    // зависшего лока (если сборка висит дольше 10 минут) происходит внутри
+    // зависшего лока (если сборка висит дольше 15 минут) происходит внутри
     // acquireShortBuildLock — если просто ответить "жди" и не вызвать её, лок
     // никогда не разблокируется через /replay, даже если процесс давно умер.
     ctx.session.shortDraft = { shortId: short.id, script: short.script };
@@ -266,7 +266,7 @@ async function resumeShortFromReplay(ctx, short) {
     if (!gotLock) {
       await ctx.reply(
         `⏳ TikTok «${short.title || "без названия"}» уже собирается. Дождись завершения — второй раз запускать не буду.\n\n` +
-        `Если сборка реально зависла дольше 10 минут, пришли /replay ещё раз — лок сбросится автоматически, и эта попытка запустит сборку заново.`
+        `Если сборка реально зависла дольше 15 минут, пришли /replay ещё раз — лок сбросится автоматически, и эта попытка запустит сборку заново.`
       );
       return;
     }

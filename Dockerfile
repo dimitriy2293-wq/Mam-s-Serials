@@ -3,14 +3,14 @@ FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 # Говорим системе не задавать вопросов при установке пакетов
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Устанавливаем нужные пакеты
+# Xvfb/x11vnc/novnc/websockify раньше стояли тут "на всякий случай", но
+# Playwright запускается с headless: true (см. lib/wavespeed-auth.js) — им
+# реально ничего не пользуется. Эти процессы висели в контейнере круглосуточно,
+# отъедая память и CPU, которые нужны ffmpeg во время монтажа short'ов, и были
+# главным подозреваемым в зависаниях сборки. Оставляем только ffmpeg.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     fonts-dejavu-core \
-    xvfb \
-    x11vnc \
-    novnc \
-    websockify \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,4 +27,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & x11vnc -forever -shared -rfbport 5900 -display :99 & websockify --web /usr/share/novnc/ 6080 localhost:5900 & DISPLAY=:99 node bot.js"]
+CMD ["node", "bot.js"]
