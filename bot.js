@@ -2,6 +2,7 @@ import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy
 import express from "express";
 import "dotenv/config";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
@@ -17,7 +18,7 @@ import {
 } from "./lib/wavespeed.js";
 import { generateVoiceover } from "./lib/elevenlabs.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
-import { ensureBucket } from "./lib/storage.js";
+import { ensureBucket, uploadToStorage } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
 import { isUrl, fetchArticle, generateShortScript } from "./lib/shorts-script.js";
 import { assembleShort } from "./lib/shorts-assemble.js";
@@ -180,6 +181,114 @@ bot.command("new_short", async (ctx) => {
   );
 });
 
+// ---------- Озвучка для /new_short ----------
+async function handleShortVoiceUpload(ctx) {
+  if (ctx.session.step !== "awaiting_short_voice" || !ctx.session.shortDraft?.shortId) return false;
+
+  const shortId = ctx.session.shortDraft.shortId;
+  const script = ctx.session.shortDraft.script;
+  const message = ctx.message;
+
+  const isAudio = Boolean(message.audio);
+  const isDocument = Boolean(message.document);
+  if (!isAudio && !isDocument) return false;
+
+  const fileName =
+    message.audio?.file_name ||
+    message.document?.file_name ||
+    `voiceover_${Date.now()}.mp3`;
+
+  const extFromName = path.extname(fileName).toLowerCase();
+  const mime = message.audio?.mime_type || message.document?.mime_type || "";
+  const allowedExt = [".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".aac"];
+
+  let ext = extFromName;
+  if (!allowedExt.includes(ext)) {
+    if (mime.includes("mpeg")) ext = ".mp3";
+    else if (mime.includes("wav")) ext = ".wav";
+    else if (mime.includes("mp4") || mime.includes("m4a")) ext = ".m4a";
+    else if (mime.includes("ogg") || mime.includes("opus")) ext = ".ogg";
+    else return false;
+  }
+
+  const workDir = fs.mkdtempSync("/tmp/short-upload-");
+  const localPath = path.join(workDir, `voiceover${ext}`);
+
+  try {
+    await ctx.reply("🎙️ Озвучка получена! Скачиваю файл и начинаю сборку...");
+
+    const file = await ctx.getFile();
+    await file.download(localPath);
+
+    const voiceoverUrl = await uploadToStorage(localPath, "short-voiceovers");
+
+    const { error: updateError } = await supabase
+      .from("shorts")
+      .update({
+        status: "processing",
+        voiceover_audio_url: voiceoverUrl,
+      })
+      .eq("id", shortId);
+
+    if (updateError) throw new Error(`Не удалось сохранить озвучку: ${updateError.message}`);
+
+    await ctx.reply("🎬 Начинаю монтаж. Это может занять несколько минут...");
+
+    const { localPath: finalPath, publicUrl, totalDurationSec } = await assembleShort(script, {
+      voiceoverUrl,
+      onProgress: (msg) => bot.api.sendMessage(ctx.chat.id, msg),
+    });
+
+    const { error: completeError } = await supabase
+      .from("shorts")
+      .update({
+        status: "completed",
+        final_video_url: publicUrl,
+        error: null,
+      })
+      .eq("id", shortId);
+
+    if (completeError) {
+      console.error("Не удалось обновить статус short:", completeError);
+    }
+
+    ctx.session.step = null;
+    ctx.session.shortDraft = {};
+
+    await ctx.replyWithVideo(new InputFile(finalPath), {
+      caption: `✅ Готово! TikTok собран полностью.\\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
+    });
+
+    return true;
+  } catch (err) {
+    console.error("Ошибка сборки short после загрузки озвучки:", err);
+
+    await supabase
+      .from("shorts")
+      .update({ status: "error", error: err.message })
+      .eq("id", shortId);
+
+    await ctx.reply(
+      `❌ Не удалось собрать TikTok.\\n\\n` +
+      `${err.message}\\n\\n` +
+      `Можешь отправить другую озвучку — я попробую собрать ролик заново.`
+    );
+    return true;
+  } finally {
+    try {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+bot.on("message:audio", async (ctx) => {
+  await handleShortVoiceUpload(ctx);
+});
+
+bot.on("message:document", async (ctx) => {
+  await handleShortVoiceUpload(ctx);
+});
+
 // ---------- Текстовые сообщения ----------
 bot.on("message:text", async (ctx, next) => {
   if (ctx.message.text.startsWith("/")) return next();
@@ -260,39 +369,43 @@ async function runShortPipeline(ctx, rawInput) {
   // Склеиваем сценарий в один чистый текст без цифр
   const cleanScript = script.segments.map(s => s.narration).join(" ");
 
-  await ctx.reply(
-    `🎬 **Сценарий готов!**\n\n` +
-    `${cleanScript}\n\n` +
-    `🔗 [Сделать озвучку в ElevenLabs](https://elevenlabs.io/app/speech-synthesis)\n\n` +
-    `⏳ Собираю видеоряд (визуал + музыка)...`
-  );
-
-  const { data: shortRecord } = await supabase
+  const { data: shortRecord, error: insertError } = await supabase
     .from("shorts")
     .insert({
       telegram_id: ctx.from.id,
       title: script.title,
       type: script.type,
       script,
-      status: "processing",
+      status: "awaiting_voice",
     })
     .select()
     .single();
 
-  try {
-    const { localPath, publicUrl } = await assembleShort(script, {
-      onProgress: (msg) => bot.api.sendMessage(chatId, msg)
-    });
-    
-    await supabase.from("shorts").update({ status: "completed", final_video_url: publicUrl }).eq("id", shortRecord.id);
-    await ctx.replyWithVideo(new InputFile(localPath), { caption: `✅ Визуал готов! Накладывай голос из ElevenLabs и заливай.` });
-  } catch (err) {
-    console.error("Ошибка сборки short:", err);
-    await supabase.from("shorts").update({ status: "error", error: err.message }).eq("id", shortRecord.id);
-    await ctx.reply(`❌ Не получилось собрать видео: ${err.message}`);
+  if (insertError || !shortRecord) {
+    console.error("Ошибка сохранения short:", insertError);
+    await ctx.reply("❌ Сценарий создан, но не удалось сохранить задачу. Попробуй /new_short ещё раз.");
+    return;
   }
-}
 
+  ctx.session.shortDraft = {
+    shortId: shortRecord.id,
+    script,
+    ogImage: ctx.session.shortDraft?.ogImage || null,
+  };
+  ctx.session.step = "awaiting_short_voice";
+
+  await ctx.reply(
+    `🎬 **Сценарий готов!**\n\n` +
+    `${cleanScript}\n\n` +
+    `🔊 **Теперь сделай озвучку:**\n` +
+    `1. Открой ElevenLabs.\n` +
+    `2. Вставь этот текст.\n` +
+    `3. Скачай готовую озвучку в MP3, WAV или M4A.\n` +
+    `4. Пришли файл сюда в этот чат.\n\n` +
+    `🔗 [Открыть ElevenLabs](https://elevenlabs.io/app/speech-synthesis)\n\n` +
+    `⏳ После получения файла я сам соберу: визуал + твою озвучку + музыку + субтитры и пришлю готовый TikTok.`
+  );
+}
 async function askLocationStep(ctx) {
   const { locations, locationQueueIndex } = ctx.session.draft;
   if (locationQueueIndex >= locations.length) {

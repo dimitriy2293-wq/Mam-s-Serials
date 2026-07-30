@@ -37,8 +37,9 @@ create table shorts (
   title text,
   type text, -- 'news' | 'story'
   script jsonb not null,
-  status text not null default 'processing', -- processing | completed | error
+  status text not null default 'processing', -- awaiting_voice | processing | completed | error
   final_video_url text,
+  voiceover_audio_url text,
   error text,
   created_at timestamptz not null default now()
 );
