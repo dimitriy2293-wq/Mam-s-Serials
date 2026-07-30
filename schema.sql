@@ -37,11 +37,20 @@ create table shorts (
   title text,
   type text, -- 'news' | 'story'
   script jsonb not null,
-  status text not null default 'processing', -- awaiting_voice | processing | completed | error
+  status text not null default 'processing', -- awaiting_voice | voice_received | building | completed | error
   final_video_url text,
   voiceover_audio_url text,
   error text,
+  build_lock boolean not null default false,
+  build_started_at timestamptz,
   created_at timestamptz not null default now()
 );
 
 create index shorts_telegram_id_idx on shorts(telegram_id);
+
+-- Дедупликация Telegram update_id — защита от повторной обработки одного апдейта,
+-- когда Telegram ретраит webhook (например, если сборка видео заняла больше таймаута).
+create table processed_updates (
+  update_id bigint primary key,
+  processed_at timestamptz not null default now()
+);

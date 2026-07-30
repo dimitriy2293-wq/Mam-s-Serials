@@ -42,6 +42,80 @@ function normalizeName(name) {
   return (name || "").trim().toLowerCase();
 }
 
+// ---------- Дедупликация Telegram update ----------
+// Render может перезапустить процесс или не ответить Telegram вовремя (сборка видео
+// занимает несколько минут) — тогда Telegram присылает ТОТ ЖЕ update повторно.
+// Без защиты это приводило к тому, что один и тот же TikTok собирался несколько раз
+// параллельно. Решение: атомарно фиксируем update_id в Supabase; если он уже есть —
+// значит апдейт уже обрабатывается/обработан, второй раз ничего не делаем.
+bot.use(async (ctx, next) => {
+  const updateId = ctx.update?.update_id;
+  if (updateId == null) return next();
+
+  const { error } = await supabase.from("processed_updates").insert({ update_id: updateId });
+
+  if (error) {
+    if (error.code === "23505") {
+      // unique_violation — это повторная доставка одного и того же update, игнорируем.
+      console.log(`Дубликат update_id=${updateId}, пропускаю повторную обработку.`);
+      return;
+    }
+    // Если таблицы ещё нет или Supabase недоступен — не блокируем бота, просто логируем.
+    console.error("Дедупликация update не сработала (продолжаю без неё):", error.message);
+  }
+
+  return next();
+});
+
+// ---------- Build-lock для сборки Shorts ----------
+// Один флаг в памяти процесса (let isBuilding = false) не спасает, потому что Render
+// может держать/перезапускать несколько процессов. Поэтому лок хранится в Supabase и
+// берётся ОДНИМ атомарным UPDATE: строка обновляется, только если лока ещё нет —
+// Postgres гарантирует, что при двух одновременных запросах выиграет только один.
+const BUILD_LOCK_STALE_MS = 10 * 60 * 1000; // если сборка "висит" дольше 10 минут — считаем её зависшей
+
+async function acquireShortBuildLock(shortId) {
+  const staleThreshold = new Date(Date.now() - BUILD_LOCK_STALE_MS).toISOString();
+
+  await supabase
+    .from("shorts")
+    .update({
+      status: "error",
+      build_lock: false,
+      error: "Сборка зависла (дольше 10 минут) и была сброшена автоматически. Нажми /replay.",
+    })
+    .eq("id", shortId)
+    .eq("build_lock", true)
+    .lt("build_started_at", staleThreshold);
+
+  const { data, error } = await supabase
+    .from("shorts")
+    .update({
+      status: "building",
+      build_lock: true,
+      build_started_at: new Date().toISOString(),
+      error: null,
+    })
+    .eq("id", shortId)
+    .or("build_lock.is.false,build_lock.is.null")
+    .select()
+    .maybeSingle();
+
+  if (error) {
+    console.error("Ошибка при попытке взять build_lock:", error);
+    return false;
+  }
+  return Boolean(data);
+}
+
+async function releaseShortBuildLock(shortId, patch = {}) {
+  const { error } = await supabase
+    .from("shorts")
+    .update({ build_lock: false, ...patch })
+    .eq("id", shortId);
+  if (error) console.error("Не удалось освободить build_lock:", error);
+}
+
 bot.use(session({
   initial: () => ({ step: null, draft: {} }),
   storage: supabaseSessionStorage,
@@ -134,7 +208,7 @@ bot.command("replay", async (ctx) => {
     .from("shorts")
     .select("*")
     .eq("telegram_id", telegramId)
-    .in("status", ["error", "processing", "awaiting_voice"])
+    .in("status", ["error", "processing", "awaiting_voice", "voice_received", "building"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -181,15 +255,30 @@ async function resumeShortFromReplay(ctx, short) {
       return;
     }
 
-    ctx.session.shortDraft = { shortId: short.id, script: short.script };
-    ctx.session.step = "awaiting_short_voice";
-    await supabase.from("shorts").update({ status: "processing", error: null }).eq("id", short.id);
-    await ctx.reply(`🔄 Возобновляю сборку TikTok «${short.title || "без названия"}» с сохранённой озвучкой...`);
+    if (short.status === "building") {
+      await ctx.reply(
+        `⏳ TikTok «${short.title || "без названия"}» уже собирается. Дождись завершения — второй раз запускать не буду.\n\n` +
+        `Если сборка реально зависла дольше 10 минут, просто пришли /replay ещё раз — лок сбросится автоматически.`
+      );
+      return;
+    }
 
+    // На всякий случай сбрасываем шаг диалога — дальше судьбу сборки решает build_lock в базе,
+    // а не сессия, так что случайный повторный апдейт/сообщение не запустит вторую сборку.
+    ctx.session.shortDraft = { shortId: short.id, script: short.script };
+    ctx.session.step = null;
+
+    const gotLock = await acquireShortBuildLock(short.id);
+    if (!gotLock) {
+      await ctx.reply(`⏳ TikTok «${short.title || "без названия"}» уже собирается. Дождись завершения.`);
+      return;
+    }
+
+    await ctx.reply(`🔄 Возобновляю сборку TikTok «${short.title || "без названия"}» с сохранённой озвучкой...`);
     await assembleShortForTelegram(ctx, short.id, short.script, short.voiceover_audio_url);
   } catch (err) {
     console.error("Ошибка /replay для short:", err);
-    await supabase.from("shorts").update({ status: "error", error: err.message }).eq("id", short.id);
+    await releaseShortBuildLock(short.id, { status: "error", error: err.message });
     await ctx.reply(`❌ Не удалось продолжить TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`);
   }
 }
@@ -202,7 +291,7 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl) {
 
   const { error } = await supabase
     .from("shorts")
-    .update({ status: "completed", final_video_url: publicUrl, error: null })
+    .update({ status: "completed", final_video_url: publicUrl, error: null, build_lock: false })
     .eq("id", shortId);
   if (error) console.error("Не удалось обновить completed short:", error);
 
@@ -288,7 +377,7 @@ async function handleShortVoiceUpload(ctx) {
   const localPath = path.join(workDir, `voiceover${ext}`);
 
   try {
-    await ctx.reply("🎙️ Озвучка получена! Скачиваю файл и начинаю сборку...");
+    await ctx.reply("🎙️ Озвучка получена! Скачиваю файл...");
 
     // В grammY File нет метода download(). Скачиваем файл через Telegram Bot API.
     const file = await ctx.api.getFile(message.audio?.file_id || message.document?.file_id);
@@ -307,13 +396,21 @@ async function handleShortVoiceUpload(ctx) {
 
     const { error: updateError } = await supabase
       .from("shorts")
-      .update({
-        status: "processing",
-        voiceover_audio_url: voiceoverUrl,
-      })
+      .update({ status: "voice_received", voiceover_audio_url: voiceoverUrl })
       .eq("id", shortId);
 
     if (updateError) throw new Error(`Не удалось сохранить озвучку: ${updateError.message}`);
+
+    // С этого момента диалоговый шаг больше не должен запускать новую сборку — судьбу
+    // сборки решает build_lock в базе. Это защищает от повторного Telegram-апдейта
+    // (тот же файл, доставленный дважды) даже если дедупликация по update_id почему-то не сработала.
+    ctx.session.step = null;
+
+    const gotLock = await acquireShortBuildLock(shortId);
+    if (!gotLock) {
+      await ctx.reply("⏳ Сборка этого TikTok уже идёт. Дождись результата — второй раз запускать не буду.");
+      return true;
+    }
 
     await ctx.reply("🎬 Начинаю монтаж. Это может занять несколько минут...");
     await assembleShortForTelegram(ctx, shortId, script, voiceoverUrl);
@@ -322,15 +419,12 @@ async function handleShortVoiceUpload(ctx) {
   } catch (err) {
     console.error("Ошибка сборки short после загрузки озвучки:", err);
 
-    await supabase
-      .from("shorts")
-      .update({ status: "error", error: err.message })
-      .eq("id", shortId);
+    await releaseShortBuildLock(shortId, { status: "error", error: err.message });
 
     await ctx.reply(
       `❌ Не удалось собрать TikTok.\n\n` +
       `${err.message}\n\n` +
-      `Можешь отправить другую озвучку — я попробую собрать ролик заново.`
+      `Нажми /replay, чтобы попробовать ещё раз.`
     );
     return true;
   } finally {
