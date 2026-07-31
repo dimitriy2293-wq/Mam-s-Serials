@@ -792,32 +792,48 @@ async function processEpisode(ctx, episode) {
 
       let record = existingByNumber.get(sceneNumber);
       if (!record) {
+        // Собираем ссылки на референс-фото персонажей сцены заранее — они нужны
+        // и для генерации референса сцены, и чуть ниже для генерации видео.
+        const charRefs = (scene.character_names || [])
+          .map((n) => characters.find((c) => c.name === n)?.ref_image_url)
+          .filter(Boolean);
+
         let referenceImageUrl = null;
         try {
           const loc = locationByName.get(scene.location_name);
           const locationImageUrl = loc ? loc.image_url : null;
-          referenceImageUrl = await generateSceneReferenceImage({
-            scenePrompt: scene.action_prompt,
+          // generateSceneReferenceImage (lib/wavespeed.js) ждёт позиционные аргументы,
+          // а не объект с именованными полями — раньше здесь передавался объект, и
+          // внутри функции characterImageUrls оказывался undefined, что падало с
+          // "characterImageUrls is not iterable" при попытке ...characterImageUrls.
+          referenceImageUrl = await generateSceneReferenceImage(
             locationImageUrl,
-            charactersInScene: scene.character_names,
-            allCharacters: characters,
-            style: "Minecraft-style, blocky, low texture, vibrant colors",
-          });
+            charRefs,
+            scene.character_position || "in the scene"
+          );
         } catch (err) {
           console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
         }
 
-        const { data: newScene } = await supabase
+        const { data: newScene, error: insertSceneError } = await supabase
           .from("scenes")
           .insert({ episode_id: episode.id, scene_number: sceneNumber, prompt: scene.action_prompt, status: "pending", reference_image_url: referenceImageUrl })
           .select().single();
+
+        if (insertSceneError || !newScene) {
+          throw new Error(`Не удалось сохранить сцену ${sceneNumber} в базу: ${insertSceneError?.message || "неизвестная ошибка"}`);
+        }
         record = newScene;
 
-        const charRefs = (scene.character_names || []).map((n) => characters.find((c) => c.name === n)?.ref_image_url).filter(Boolean);
-
-        const taskId = await generateVideoScene(
-          scene.action_prompt, charRefs, record.reference_image_url || undefined, "Minecraft-style, blocky, low texture, vibrant colors"
-        );
+        // generateVideoScene (lib/wavespeed.js) тоже ждёт объект { referenceImageUrl, prompt },
+        // а не позиционные аргументы — раньше сюда передавались 4 позиционных значения,
+        // и внутри всё разваливалось в undefined. Плюс функция возвращает { job_id }, а
+        // не голую строку — раньше taskId был целым объектом вместо ID задачи.
+        const videoResult = await generateVideoScene({
+          referenceImageUrl: record.reference_image_url || undefined,
+          prompt: scene.action_prompt,
+        });
+        const taskId = videoResult.job_id;
         await supabase.from("scenes").update({ task_id: taskId, status: "processing" }).eq("id", record.id);
         record.task_id = taskId;
         record.status = "processing";
@@ -892,13 +908,18 @@ async function pollScenes(ctx, episodeId) {
         if (!scene.task_id) continue;
         try {
           const status = await checkVideoStatus(scene.task_id);
-          if (status.status === "COMPLETED") {
+          // checkVideoStatus (lib/wavespeed.js) возвращает { done, video_url } или
+          // { done: false, error: true/false } — раньше здесь проверялось несуществующее
+          // поле status.status === "COMPLETED"/"FAILED", которое никогда не совпадало,
+          // и сцена вечно висела в "processing", а pollScenes не завершался никогда.
+          if (status.done) {
             await supabase.from("scenes").update({ status: "completed", video_url: status.video_url }).eq("id", scene.id);
             await ctx.reply(`✅ Сцена ${scene.scene_number} готова!`);
-          } else if (status.status === "FAILED") {
+          } else if (status.error) {
             await supabase.from("scenes").update({ status: "failed" }).eq("id", scene.id);
             await ctx.reply(`❌ Ошибка генерации сцены ${scene.scene_number}.`);
           }
+          // иначе — ещё генерируется, ничего не делаем, проверим на следующем цикле опроса
         } catch (err) {
           console.error(`Ошибка проверки сцены ${scene.id}:`, err);
         }
