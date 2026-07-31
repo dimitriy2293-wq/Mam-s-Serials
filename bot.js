@@ -280,30 +280,62 @@ async function resumeShortFromReplay(ctx, short) {
   }
 }
 
+// ---------- Мгновенное освобождение build_lock при перезапуске контейнера ----------
+// Render (особенно на бесплатном тарифе — засыпает при простое и рестартует) может
+// остановить контейнер прямо посреди сборки short'а. Раньше это обнаруживалось только
+// через 15-минутный auto-reset зависшего лока. Теперь при штатной остановке (SIGTERM,
+// её шлёт Render перед перезапуском/редеплоем) мы успеваем разблокировать текущий short
+// за отведённые секунды до полного завершения процесса — /replay после рестарта сработает
+// сразу, без ожидания.
+let currentlyBuildingShortId = null;
+
+async function gracefulShutdown(signal) {
+  console.log(`Получен ${signal} — контейнер останавливается.`);
+  if (currentlyBuildingShortId) {
+    console.log(`Освобождаю build_lock для short ${currentlyBuildingShortId} перед выходом...`);
+    try {
+      await releaseShortBuildLock(currentlyBuildingShortId, {
+        status: "error",
+        error: `Контейнер был перезапущен во время сборки (${signal}). Нажми /replay.`,
+      });
+    } catch (err) {
+      console.error("Не удалось освободить build_lock при остановке:", err);
+    }
+  }
+  process.exit(0);
+}
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
 async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl) {
-  const { localPath: finalPath, publicUrl, totalDurationSec } = await assembleShort(script, {
-    voiceoverUrl,
-    onProgress: (msg) => bot.api.sendMessage(ctx.chat.id, msg),
-  });
-
-  const { error } = await supabase
-    .from("shorts")
-    .update({ status: "completed", final_video_url: publicUrl, error: null, build_lock: false })
-    .eq("id", shortId);
-  if (error) console.error("Не удалось обновить completed short:", error);
-
-  ctx.session.step = null;
-  ctx.session.shortDraft = {};
-
-  await ctx.replyWithVideo(new InputFile(finalPath), {
-    caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
-  });
-
-  // После отправки видео удаляем временную папку сборки, чтобы Render не забивал диск.
+  currentlyBuildingShortId = shortId;
   try {
-    fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
-  } catch (cleanupError) {
-    console.warn("Не удалось очистить временные файлы short:", cleanupError.message);
+    const { localPath: finalPath, publicUrl, totalDurationSec } = await assembleShort(script, {
+      voiceoverUrl,
+      onProgress: (msg) => bot.api.sendMessage(ctx.chat.id, msg),
+    });
+
+    const { error } = await supabase
+      .from("shorts")
+      .update({ status: "completed", final_video_url: publicUrl, error: null, build_lock: false })
+      .eq("id", shortId);
+    if (error) console.error("Не удалось обновить completed short:", error);
+
+    ctx.session.step = null;
+    ctx.session.shortDraft = {};
+
+    await ctx.replyWithVideo(new InputFile(finalPath), {
+      caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
+    });
+
+    // После отправки видео удаляем временную папку сборки, чтобы Render не забивал диск.
+    try {
+      fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
+    } catch (cleanupError) {
+      console.warn("Не удалось очистить временные файлы short:", cleanupError.message);
+    }
+  } finally {
+    currentlyBuildingShortId = null;
   }
 }
 
