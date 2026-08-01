@@ -1,4 +1,4 @@
-import { Bot, session, InlineKeyboard, InputFile, webhookCallback } from "grammy";
+import { Bot, session, InlineKeyboard, Keyboard, InputFile, webhookCallback } from "grammy";
 import express from "express";
 import "dotenv/config";
 import path from "path";
@@ -124,17 +124,51 @@ bot.use(session({
 }));
 
 // ---------- /start ----------
+// ---------- Постоянное меню (как у barber-бота на скриншоте) ----------
+// В отличие от InlineKeyboard (кнопки под одним сообщением, пропадают в истории),
+// это Reply Keyboard — висит внизу экрана всегда, пока не заменят. Два таба:
+// создание сериала и создание TikTok, без необходимости помнить слэш-команды.
+const mainMenuKeyboard = new Keyboard()
+  .text("🎬 Создать сериал")
+  .text("🎥 Создать TikTok")
+  .resized();
+
 bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету, а ещё умею делать короткие TikTok-style видео.\n\n" +
-    "Нажми /new_episode чтобы начать новый эпизод сериала.\n" +
-    "Нажми /new_short чтобы сделать короткое видео (30-40 сек) по ссылке на статью или по теме.\n" +
+    "Выбери внизу, что хочешь сделать — 🎬 сериал или 🎥 TikTok.\n\n" +
     "Команда `/update_key` — автоматическое обновление ключа WaveSpeed.\n" +
     "Команда `/update_key <ключ>` — ручное обновление.\n" +
     "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось.",
-    { parse_mode: "Markdown" }
+    { parse_mode: "Markdown", reply_markup: mainMenuKeyboard }
   );
 });
+
+async function startNewEpisode(ctx) {
+  ctx.session.step = "awaiting_draft_choice";
+  ctx.session.draft = {};
+  const kb = new InlineKeyboard()
+    .text("У меня есть сюжет", "draft_yes")
+    .text("Сгенерировать с нуля", "draft_no");
+
+  await ctx.reply("Есть у тебя готовая идея сюжета, или сгенерировать с нуля?", { reply_markup: kb });
+}
+
+async function startNewShort(ctx) {
+  ctx.session.shortDraft = {};
+  ctx.session.step = "awaiting_short_input";
+  await ctx.reply(
+    "Пришли ссылку на статью, или просто опиши тему/идею для короткого видео.\n\n" +
+    "Голос — русский (ElevenLabs), субтитры слово-за-словом, видео/фото со стоков (Pexels/Pixabay).\n\n" +
+    "💡 Хочешь, чтобы стиль роликов ориентировался на конкретные примеры — пришли /learn_style."
+  );
+}
+
+bot.hears("🎬 Создать сериал", startNewEpisode);
+bot.hears("🎥 Создать TikTok", startNewShort);
+
+// ---------- /new_episode ----------
+bot.command("new_episode", startNewEpisode);
 
 // ---------- ОБНОВЛЕНИЕ КЛЮЧА ----------
 bot.command("update_key", async (ctx) => {
@@ -334,9 +368,21 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl) {
     ctx.session.step = null;
     ctx.session.shortDraft = {};
 
-    await ctx.replyWithVideo(new InputFile(finalPath), {
-      caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
-    });
+    // Отдаём Telegram ПУБЛИЧНУЮ ССЫЛКУ, а не байты файла через себя — их сервера
+    // сами скачают видео с Supabase Storage напрямую, это быстро и не зависит от
+    // (обычно урезанной на бесплатных тарифах) исходящей скорости Render. Раньше
+    // здесь был InputFile(finalPath), то есть загрузка ЧЕРЕЗ бота — на медленном
+    // канале именно это упиралось в таймаут sendVideo на 500 секунд.
+    try {
+      await ctx.replyWithVideo(publicUrl, {
+        caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
+      });
+    } catch (sendErr) {
+      console.warn("Отправка по ссылке не удалась, пробую загрузить файл напрямую:", sendErr.message);
+      await ctx.replyWithVideo(new InputFile(finalPath), {
+        caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
+      });
+    }
 
     // После отправки видео удаляем временную папку сборки, чтобы Render не забивал диск.
     try {
@@ -350,16 +396,6 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl) {
 }
 
 // ---------- /new_episode ----------
-bot.command("new_episode", async (ctx) => {
-  ctx.session.step = "awaiting_draft_choice";
-  ctx.session.draft = {};
-  const kb = new InlineKeyboard()
-    .text("У меня есть сюжет", "draft_yes")
-    .text("Сгенерировать с нуля", "draft_no");
-    
-  await ctx.reply("Есть у тебя готовая идея сюжета, или сгенерировать с нуля?", { reply_markup: kb });
-});
-
 bot.callbackQuery("draft_yes", async (ctx) => {
   ctx.session.step = "awaiting_draft_text";
   await safeAnswer(ctx);
@@ -373,15 +409,7 @@ bot.callbackQuery("draft_no", async (ctx) => {
 });
 
 // ---------- /new_short ----------
-bot.command("new_short", async (ctx) => {
-  ctx.session.shortDraft = {};
-  ctx.session.step = "awaiting_short_input";
-  await ctx.reply(
-    "Пришли ссылку на статью, или просто опиши тему/идею для короткого видео.\n\n" +
-    "Голос — русский (ElevenLabs), субтитры слово-за-словом, видео/фото со стоков (Pexels/Pixabay).\n\n" +
-    "💡 Хочешь, чтобы стиль роликов ориентировался на конкретные примеры — пришли /learn_style."
-  );
-});
+bot.command("new_short", startNewShort);
 
 // ---------- /learn_style — анализ референсных видео (можно пачкой/альбомом) ----------
 // Никакого выбора стиля перед каждым /new_short: всё, что бот разобрал через
