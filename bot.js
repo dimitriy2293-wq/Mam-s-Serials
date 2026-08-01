@@ -21,6 +21,7 @@ import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket, uploadToStorage } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
 import { isUrl, fetchArticle, generateShortScript } from "./lib/shorts-script.js";
+import { analyzeStyleFromVideo, MAX_STYLE_VIDEO_BYTES } from "./lib/style-learning.js";
 import { assembleShort } from "./lib/shorts-assemble.js";
 
 // ДОБАВЛЕНО: Импорт функций обхода WaveSpeed
@@ -272,7 +273,16 @@ async function resumeShortFromReplay(ctx, short) {
     }
 
     await ctx.reply(`🔄 Возобновляю сборку TikTok «${short.title || "без названия"}» с сохранённой озвучкой...`);
-    await assembleShortForTelegram(ctx, short.id, short.script, short.voiceover_audio_url);
+
+    // Не await — сборка идёт в фоне, не держит открытым Telegram-запрос. Это
+    // критично уже сейчас (сборка может занять несколько минут), а без этого
+    // длинные ролики (5-10 мин) вообще не смогли бы работать — Telegram решит,
+    // что вебхук не доставлен, и начнёт ретраить, пока процесс молча тянется.
+    assembleShortForTelegram(ctx, short.id, short.script, short.voiceover_audio_url).catch(async (err) => {
+      console.error("Ошибка /replay для short:", err);
+      await releaseShortBuildLock(short.id, { status: "error", error: err.message });
+      await ctx.reply(`❌ Не удалось продолжить TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`).catch(() => {});
+    });
   } catch (err) {
     console.error("Ошибка /replay для short:", err);
     await releaseShortBuildLock(short.id, { status: "error", error: err.message });
@@ -364,13 +374,105 @@ bot.callbackQuery("draft_no", async (ctx) => {
 
 // ---------- /new_short ----------
 bot.command("new_short", async (ctx) => {
-  ctx.session.step = "awaiting_short_input";
   ctx.session.shortDraft = {};
+  ctx.session.step = "awaiting_short_input";
   await ctx.reply(
-    "Пришли ссылку на статью, или просто опиши тему/идею для короткого видео (30-40 сек).\n\n" +
-    "Голос — русский (ElevenLabs), субтитры слово-за-словом, видео/фото со стоков (Pexels/Pixabay)."
+    "Пришли ссылку на статью, или просто опиши тему/идею для короткого видео.\n\n" +
+    "Голос — русский (ElevenLabs), субтитры слово-за-словом, видео/фото со стоков (Pexels/Pixabay).\n\n" +
+    "💡 Хочешь, чтобы стиль роликов ориентировался на конкретные примеры — пришли /learn_style."
   );
 });
+
+// ---------- /learn_style — анализ референсных видео (можно пачкой/альбомом) ----------
+// Никакого выбора стиля перед каждым /new_short: всё, что бот разобрал через
+// /learn_style, копится в short_styles и автоматически подмешивается в промпт
+// генерации сценария (см. runShortPipeline ниже) — просто "общее знание" стиля,
+// без отдельного шага выбора.
+bot.command("learn_style", async (ctx) => {
+  await ctx.reply(
+    "Пришли сюда одно или несколько видео файлом (можно сразу пачкой/альбомом, не по одному) — " +
+    "разберу хук, темп, структуру, стиль субтитров и музыки в каждом, и учту это в следующих сценариях.\n\n" +
+    "⚠️ Telegram отдаёт боту файлы только до 20 MB за штуку — если видео тяжелее, сожми или обрежь покороче."
+  );
+});
+
+// Буфер для группировки видео, присланных пачкой (альбомом) или просто одно за
+// другим быстро: ждём VIDEO_BATCH_DEBOUNCE_MS тишины после последнего видео и
+// только потом обрабатываем всё разом, чтобы не заваливать пользователя
+// отдельным отчётом на каждый файл.
+const videoBatchBuffers = new Map(); // telegram_id -> { videos: [...], timer, ctx }
+const VIDEO_BATCH_DEBOUNCE_MS = 2500;
+
+bot.on("message:video", async (ctx) => {
+  const userId = ctx.from.id;
+  let buffer = videoBatchBuffers.get(userId);
+  if (!buffer) {
+    buffer = { videos: [], timer: null, ctx };
+    videoBatchBuffers.set(userId, buffer);
+  }
+  buffer.videos.push(ctx.message.video);
+  buffer.ctx = ctx; // берём самый свежий ctx, чтобы отвечать в актуальный чат
+
+  if (buffer.timer) clearTimeout(buffer.timer);
+  buffer.timer = setTimeout(() => processVideoBatch(userId), VIDEO_BATCH_DEBOUNCE_MS);
+});
+
+async function processVideoBatch(userId) {
+  const buffer = videoBatchBuffers.get(userId);
+  if (!buffer) return;
+  videoBatchBuffers.delete(userId);
+
+  const { videos, ctx } = buffer;
+  await ctx.reply(
+    videos.length > 1
+      ? `📼 Получил ${videos.length} видео, разбираю стиль каждого (это может занять несколько минут)...`
+      : `📼 Видео получено, разбираю стиль (может занять минуту)...`
+  );
+
+  let savedCount = 0;
+  const failedReasons = [];
+
+  for (const video of videos) {
+    if (video.file_size && video.file_size > MAX_STYLE_VIDEO_BYTES) {
+      failedReasons.push(`${(video.file_size / 1024 / 1024).toFixed(1)} MB — больше 20 MB, Telegram не отдаст файл боту.`);
+      continue;
+    }
+
+    const workDir = fs.mkdtempSync("/tmp/style-video-");
+    const localPath = path.join(workDir, "reference.mp4");
+    try {
+      const file = await ctx.api.getFile(video.file_id);
+      if (!file.file_path) throw new Error("Telegram не вернул путь к файлу видео.");
+      const telegramFileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      const response = await fetch(telegramFileUrl);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      fs.writeFileSync(localPath, Buffer.from(await response.arrayBuffer()));
+
+      const styleProfile = await analyzeStyleFromVideo(localPath);
+
+      const { error: insertError } = await supabase
+        .from("short_styles")
+        .insert({ telegram_id: userId, name: `видео от ${new Date().toLocaleDateString("ru-RU")}`, style_profile: styleProfile });
+      if (insertError) throw new Error(insertError.message);
+
+      savedCount++;
+    } catch (err) {
+      console.error("Ошибка анализа стиля видео:", err);
+      failedReasons.push(err.message);
+    } finally {
+      try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  let reply = `✅ Разобрано и сохранено: ${savedCount}/${videos.length}.`;
+  if (failedReasons.length > 0) {
+    reply += `\n\n❌ Не получилось разобрать:\n${failedReasons.map((r) => `— ${r}`).join("\n")}`;
+  }
+  if (savedCount > 0) {
+    reply += `\n\nТеперь новые сценарии в /new_short будут ориентироваться на стиль этих роликов.`;
+  }
+  await ctx.reply(reply);
+}
 
 // ---------- Озвучка для /new_short ----------
 async function handleShortVoiceUpload(ctx) {
@@ -442,7 +544,15 @@ async function handleShortVoiceUpload(ctx) {
     }
 
     await ctx.reply("🎬 Начинаю монтаж. Это может занять несколько минут...");
-    await assembleShortForTelegram(ctx, shortId, script, voiceoverUrl);
+
+    // Не await — сборка уходит в фон, ответ Telegram-вебхуку не ждёт её завершения.
+    assembleShortForTelegram(ctx, shortId, script, voiceoverUrl).catch(async (err) => {
+      console.error("Ошибка сборки short после загрузки озвучки:", err);
+      await releaseShortBuildLock(shortId, { status: "error", error: err.message });
+      await ctx.reply(
+        `❌ Не удалось собрать TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`
+      ).catch(() => {});
+    });
 
     return true;
   } catch (err) {
@@ -527,6 +637,17 @@ async function runShortPipeline(ctx, rawInput) {
   const chatId = ctx.chat.id;
   let script;
 
+  // Подмешиваем накопленный стиль автоматически, без выбора — всё, что разобрано
+  // через /learn_style, работает как общее "знание" стиля, берём последние 5,
+  // чтобы не раздувать промпт до бесконечности.
+  const { data: learnedStyles } = await supabase
+    .from("short_styles")
+    .select("style_profile")
+    .eq("telegram_id", ctx.from.id)
+    .order("created_at", { ascending: false })
+    .limit(5);
+  const styleProfiles = (learnedStyles || []).map((r) => r.style_profile);
+
   try {
     if (isUrl(rawInput)) {
       await ctx.reply("Загружаю статью по ссылке...");
@@ -537,10 +658,10 @@ async function runShortPipeline(ctx, rawInput) {
       }
       ctx.session.shortDraft = { ogImage };
       await ctx.reply("Статья загружена, пишу сценарий...");
-      script = await generateShortScript({ input: articleText, isArticle: true });
+      script = await generateShortScript({ input: articleText, isArticle: true, styleProfiles });
     } else {
       await ctx.reply("Пишу сценарий...");
-      script = await generateShortScript({ input: rawInput, isArticle: false });
+      script = await generateShortScript({ input: rawInput, isArticle: false, styleProfiles });
     }
   } catch (err) {
     console.error("Ошибка генерации сценария short:", err);
