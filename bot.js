@@ -965,23 +965,29 @@ async function processEpisode(ctx, episode) {
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
   let voiceoverFailWarned = false;
 
+  // Схема сценария использует primary_character/secondary_characters вместо единого
+  // character_names — этот хелпер просто собирает их в один список для мест, где
+  // нужны "все персонажи сцены" (референс-фото, озвучка).
+  const sceneCharacterNames = (scene) =>
+    [scene.primary_character, ...(scene.secondary_characters || [])].filter(Boolean);
+
   try {
     for (let i = 0; i < scenes.length; i++) {
       const scene = scenes[i];
       const sceneNumber = i + 1;
-      await ctx.reply(`Сцена ${sceneNumber}/${scenes.length}: ${scene.action_prompt}`);
+      await ctx.reply(`Сцена ${sceneNumber}/${scenes.length}: ${scene.script_text}`);
 
       let record = existingByNumber.get(sceneNumber);
       if (!record) {
         // Собираем ссылки на референс-фото персонажей сцены заранее — они нужны
         // и для генерации референса сцены, и чуть ниже для генерации видео.
-        const charRefs = (scene.character_names || [])
+        const charRefs = sceneCharacterNames(scene)
           .map((n) => characters.find((c) => c.name === n)?.ref_image_url)
           .filter(Boolean);
 
         let referenceImageUrl = null;
         try {
-          const loc = locationByName.get(scene.location_name);
+          const loc = locationByName.get(scene.location);
           const locationImageUrl = loc ? loc.image_url : null;
           // generateSceneReferenceImage (lib/wavespeed.js) ждёт позиционные аргументы,
           // а не объект с именованными полями — раньше здесь передавался объект, и
@@ -998,7 +1004,7 @@ async function processEpisode(ctx, episode) {
 
         const { data: newScene, error: insertSceneError } = await supabase
           .from("scenes")
-          .insert({ episode_id: episode.id, scene_number: sceneNumber, prompt: scene.action_prompt, status: "pending", reference_image_url: referenceImageUrl })
+          .insert({ episode_id: episode.id, scene_number: sceneNumber, prompt: scene.script_text, status: "pending", reference_image_url: referenceImageUrl })
           .select().single();
 
         if (insertSceneError || !newScene) {
@@ -1012,7 +1018,7 @@ async function processEpisode(ctx, episode) {
         // не голую строку — раньше taskId был целым объектом вместо ID задачи.
         const videoResult = await generateVideoScene({
           referenceImageUrl: record.reference_image_url || undefined,
-          prompt: scene.action_prompt,
+          prompt: scene.script_text,
         });
         const taskId = videoResult.job_id;
         await supabase.from("scenes").update({ task_id: taskId, status: "processing" }).eq("id", record.id);
@@ -1022,7 +1028,7 @@ async function processEpisode(ctx, episode) {
 
       if (scene.voiceover_text && !record.voiceover_audio_url) {
         try {
-          const speakerName = (scene.character_names || [])[0] || scene.primary_character || null;
+          const speakerName = sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
 
           const audioUrl = await generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || "");
@@ -1109,7 +1115,10 @@ async function pollScenes(ctx, episodeId) {
 }
 
 function formatScriptPreview(script) {
-  return script.scenes.map((s, i) => `**Сцена ${i + 1}**: ${s.action_prompt}\n   Локация: ${s.location_name}\n   Персонажи: ${(s.character_names || []).join(", ")}\n`).join("\n");
+  return script.scenes.map((s, i) => {
+    const chars = [s.primary_character, ...(s.secondary_characters || [])].filter(Boolean);
+    return `**Сцена ${i + 1}**: ${s.script_text}\n   Локация: ${s.location}\n   Персонажи: ${chars.join(", ")}\n`;
+  }).join("\n");
 }
 
 await ensureBucket();
