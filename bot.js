@@ -955,7 +955,14 @@ async function processEpisode(ctx, episode) {
     for (const loc of missingLocations) {
       try {
         loc.image_url = await generateLocationImage(loc.description);
-      } catch (err) {}
+      } catch (err) {
+        // Раньше ошибка тут проглатывалась молча (catch (err) {}) — фон оставался
+        // null, и это всплывало только позже непонятной ошибкой WaveSpeed
+        // "images.0 failed nullable validation" при генерации сцены. Теперь видно
+        // сразу, что и почему не получилось.
+        console.error(`Не удалось сгенерировать фон локации "${loc.name}":`, err.message);
+        await ctx.reply(`⚠️ Не получилось сгенерировать фон для локации "${loc.name}": ${err.message}`);
+      }
     }
     await supabase.from("episodes").update({ locations }).eq("id", episode.id);
   }
@@ -989,6 +996,11 @@ async function processEpisode(ctx, episode) {
         try {
           const loc = locationByName.get(scene.location);
           const locationImageUrl = loc ? loc.image_url : null;
+
+          if (!locationImageUrl) {
+            throw new Error(`Фон локации "${scene.location}" не готов (не сгенерировался ранее) — пропускаю референс для этой сцены.`);
+          }
+
           // generateSceneReferenceImage (lib/wavespeed.js) ждёт позиционные аргументы,
           // а не объект с именованными полями — раньше здесь передавался объект, и
           // внутри функции characterImageUrls оказывался undefined, что падало с
@@ -1004,7 +1016,14 @@ async function processEpisode(ctx, episode) {
 
         const { data: newScene, error: insertSceneError } = await supabase
           .from("scenes")
-          .insert({ episode_id: episode.id, scene_number: sceneNumber, prompt: scene.script_text, status: "pending", reference_image_url: referenceImageUrl })
+          .insert({
+            episode_id: episode.id,
+            scene_number: sceneNumber,
+            script_text: scene.script_text,
+            video_status: "pending",
+            character_ref_image_url: referenceImageUrl,
+            duration_sec: scene.duration_sec || 5,
+          })
           .select().single();
 
         if (insertSceneError || !newScene) {
@@ -1017,13 +1036,13 @@ async function processEpisode(ctx, episode) {
         // и внутри всё разваливалось в undefined. Плюс функция возвращает { job_id }, а
         // не голую строку — раньше taskId был целым объектом вместо ID задачи.
         const videoResult = await generateVideoScene({
-          referenceImageUrl: record.reference_image_url || undefined,
+          referenceImageUrl: record.character_ref_image_url || undefined,
           prompt: scene.script_text,
         });
         const taskId = videoResult.job_id;
-        await supabase.from("scenes").update({ task_id: taskId, status: "processing" }).eq("id", record.id);
-        record.task_id = taskId;
-        record.status = "processing";
+        await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing" }).eq("id", record.id);
+        record.video_job_id = taskId;
+        record.video_status = "processing";
       }
 
       if (scene.voiceover_text && !record.voiceover_audio_url) {
@@ -1060,18 +1079,18 @@ async function pollScenes(ctx, episodeId) {
   while (!isDone) {
     await new Promise((res) => setTimeout(res, 30_000));
     const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
-    const pending = scenes.filter((s) => s.status === "processing" || s.status === "pending");
+    const pending = scenes.filter((s) => s.video_status === "processing" || s.video_status === "pending");
 
     if (pending.length === 0) {
       isDone = true;
-      const allSuccess = scenes.every((s) => s.status === "completed" && s.video_url);
+      const allSuccess = scenes.every((s) => s.video_status === "completed" && s.video_url);
 
       if (!allSuccess && !compositeWarned) {
          await ctx.reply("Некоторые сцены не удалось сгенерировать. Собираю эпизод из того, что получилось.");
          compositeWarned = true;
       }
 
-      const validScenes = scenes.filter(s => s.status === "completed" && s.video_url).sort((a, b) => a.scene_number - b.scene_number);
+      const validScenes = scenes.filter(s => s.video_status === "completed" && s.video_url).sort((a, b) => a.scene_number - b.scene_number);
 
       if (validScenes.length === 0) {
          await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
@@ -1091,18 +1110,18 @@ async function pollScenes(ctx, episodeId) {
       }
     } else {
       for (const scene of pending) {
-        if (!scene.task_id) continue;
+        if (!scene.video_job_id) continue;
         try {
-          const status = await checkVideoStatus(scene.task_id);
+          const status = await checkVideoStatus(scene.video_job_id);
           // checkVideoStatus (lib/wavespeed.js) возвращает { done, video_url } или
           // { done: false, error: true/false } — раньше здесь проверялось несуществующее
           // поле status.status === "COMPLETED"/"FAILED", которое никогда не совпадало,
           // и сцена вечно висела в "processing", а pollScenes не завершался никогда.
           if (status.done) {
-            await supabase.from("scenes").update({ status: "completed", video_url: status.video_url }).eq("id", scene.id);
+            await supabase.from("scenes").update({ video_status: "completed", video_url: status.video_url }).eq("id", scene.id);
             await ctx.reply(`✅ Сцена ${scene.scene_number} готова!`);
           } else if (status.error) {
-            await supabase.from("scenes").update({ status: "failed" }).eq("id", scene.id);
+            await supabase.from("scenes").update({ video_status: "failed" }).eq("id", scene.id);
             await ctx.reply(`❌ Ошибка генерации сцены ${scene.scene_number}.`);
           }
           // иначе — ещё генерируется, ничего не делаем, проверим на следующем цикле опроса
