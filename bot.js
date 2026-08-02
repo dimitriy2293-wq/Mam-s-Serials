@@ -11,12 +11,12 @@ import {
   generateSceneReferenceImage,
   generateLocationImage,
   generateVideoScene,
+  generateVoiceoverWaveSpeed,
   checkVideoStatus,
   checkBalance,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
 } from "./lib/wavespeed.js";
-import { generateVoiceover } from "./lib/elevenlabs.js";
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket, uploadToStorage } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
@@ -1024,10 +1024,9 @@ async function processEpisode(ctx, episode) {
         try {
           const speakerName = (scene.character_names || [])[0] || scene.primary_character || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
-          
-          // ДОБАВЛЕНО: Передаем ctx внутрь generateVoiceover, чтобы внутри можно было отправить скриншот
-          const audioUrl = await generateVoiceover(scene.voiceover_text, speakerName, speakerDescription, ctx);
-          
+
+          const audioUrl = await generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || "");
+
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
         } catch (err) {
