@@ -167,6 +167,103 @@ async function startNewShort(ctx) {
 bot.hears("🎬 Создать сериал", startNewEpisode);
 bot.hears("🎥 Создать TikTok", startNewShort);
 
+// ---------- Выбор визуала: свои файлы или автоподбор со стоков ----------
+bot.callbackQuery("visuals_auto", async (ctx) => {
+  await safeAnswer(ctx);
+  const { shortId, script, voiceoverUrl } = ctx.session.shortDraft || {};
+  if (!shortId) {
+    await ctx.reply("Не нашёл черновик TikTok. Начни заново — /new_short.");
+    return;
+  }
+  ctx.session.step = null;
+  await startShortBuild(ctx, shortId, script, voiceoverUrl, script?.title, []);
+});
+
+bot.callbackQuery("visuals_custom", async (ctx) => {
+  await safeAnswer(ctx);
+  const { script } = ctx.session.shortDraft || {};
+  if (!script) {
+    await ctx.reply("Не нашёл черновик TikTok. Начни заново — /new_short.");
+    return;
+  }
+  ctx.session.step = "awaiting_custom_visuals";
+  await ctx.reply(
+    `Пришли фото/видео по порядку для сегментов (можно пачкой) — всего ${script.segments.length}. ` +
+    `Если пришлёшь меньше — на оставшиеся сегменты бот подберёт визуал сам со стоков.`
+  );
+});
+
+// Буфер для сбора своих фото/видео пачкой — та же идея, что и батч видео для
+// /learn_style (ждём тишины после последнего файла, потом обрабатываем разом).
+const customVisualBuffers = new Map(); // telegram_id -> { items: [...], timer, ctx }
+const CUSTOM_VISUAL_DEBOUNCE_MS = 2500;
+
+function bufferCustomVisual(ctx, item) {
+  const userId = ctx.from.id;
+  let buffer = customVisualBuffers.get(userId);
+  if (!buffer) {
+    buffer = { items: [], timer: null, ctx };
+    customVisualBuffers.set(userId, buffer);
+  }
+  buffer.items.push(item);
+  buffer.ctx = ctx;
+
+  if (buffer.timer) clearTimeout(buffer.timer);
+  buffer.timer = setTimeout(() => processCustomVisualBatch(userId), CUSTOM_VISUAL_DEBOUNCE_MS);
+}
+
+async function processCustomVisualBatch(userId) {
+  const buffer = customVisualBuffers.get(userId);
+  if (!buffer) return;
+  customVisualBuffers.delete(userId);
+
+  const { items, ctx } = buffer;
+  const { shortId, script, voiceoverUrl } = ctx.session.shortDraft || {};
+  if (!shortId) {
+    await ctx.reply("Не нашёл черновик TikTok. Начни заново — /new_short.");
+    return;
+  }
+
+  await ctx.reply(`📁 Получил ${items.length} файл(ов), загружаю...`);
+
+  const customVisuals = [];
+  for (const item of items) {
+    const workDir = fs.mkdtempSync("/tmp/custom-visual-");
+    try {
+      const fileId = item.type === "video" ? item.message.file_id : item.message.file_id;
+      const file = await ctx.api.getFile(fileId);
+      if (!file.file_path) throw new Error("Telegram не вернул путь к файлу.");
+      const telegramFileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      const response = await fetch(telegramFileUrl);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const ext = item.type === "video" ? "mp4" : "jpg";
+      const localPath = path.join(workDir, `custom.${ext}`);
+      fs.writeFileSync(localPath, Buffer.from(await response.arrayBuffer()));
+
+      const url = await uploadToStorage(localPath, "short-custom-visuals");
+      customVisuals.push({ type: item.type, url });
+    } catch (err) {
+      console.error("Ошибка загрузки своего визуала:", err.message);
+      customVisuals.push(null); // сегмент останется без своего файла — подберётся автоматически
+    } finally {
+      try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  await supabase.from("shorts").update({ custom_visuals: customVisuals }).eq("id", shortId);
+
+  ctx.session.step = null;
+  const missing = script.segments.length - customVisuals.filter(Boolean).length;
+  await ctx.reply(
+    missing > 0
+      ? `Принял ${customVisuals.filter(Boolean).length} файл(ов). Ещё ${missing} сегмент(ов) — визуал подберу сам.`
+      : `Принял все файлы.`
+  );
+
+  await startShortBuild(ctx, shortId, script, voiceoverUrl, script?.title, customVisuals);
+}
+
 // ---------- /new_episode ----------
 bot.command("new_episode", startNewEpisode);
 
@@ -239,6 +336,12 @@ bot.command("finish_key", async (ctx) => {
 bot.command("replay", async (ctx) => {
   const telegramId = ctx.from.id;
 
+  const activeLock = await getActiveGeneration(telegramId);
+  if (activeLock) {
+    await ctx.reply(describeActiveGeneration(activeLock));
+    return;
+  }
+
   const { data: short, error: shortError } = await supabase
     .from("shorts")
     .select("*")
@@ -269,14 +372,64 @@ bot.command("replay", async (ctx) => {
     return;
   }
 
+  const gotLock = await acquireGenerationLock(telegramId, "episode", episode.id, episode.title);
+  if (!gotLock) {
+    await ctx.reply(describeActiveGeneration(await getActiveGeneration(telegramId)));
+    return;
+  }
+
   await ctx.reply(`Продолжаю эпизод «${episode.title}».`);
   await supabase.from("episodes").update({ status: "processing" }).eq("id", episode.id);
 
-  processEpisode(ctx, episode).catch((err) => {
-    console.error("Необработанная ошибка в processEpisode (replay):", err);
-    ctx.reply("Опять что-то пошло не так. Нажми /replay ещё раз.").catch(() => {});
-  });
+  processEpisode(ctx, episode)
+    .catch((err) => {
+      console.error("Необработанная ошибка в processEpisode (replay):", err);
+      ctx.reply("Опять что-то пошло не так. Нажми /replay ещё раз.").catch(() => {});
+    })
+    .finally(() => releaseGenerationLock(telegramId));
 });
+
+// Общий запуск сборки short'а — используется и из /replay, и из обычного
+// флоу после получения озвучки (см. handleShortVoiceUpload и выбор своих файлов).
+async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, customVisuals = null) {
+  const gotLock = await acquireShortBuildLock(shortId);
+  if (!gotLock) {
+    await ctx.reply(
+      `⏳ TikTok «${title || "без названия"}» уже собирается. Дождись завершения — второй раз запускать не буду.\n\n` +
+      `Если сборка реально зависла дольше 15 минут, пришли /replay ещё раз — лок сбросится автоматически, и эта попытка запустит сборку заново.`
+    );
+    return;
+  }
+
+  const gotGenerationLock = await acquireGenerationLock(ctx.from.id, "short", shortId, title);
+  if (!gotGenerationLock) {
+    await releaseShortBuildLock(shortId, { status: "error", error: "Другая генерация уже шла, начать сборку не удалось." });
+    await ctx.reply(describeActiveGeneration(await getActiveGeneration(ctx.from.id)));
+    return;
+  }
+
+  // Если своих файлов на этот short не находили/не сохраняли раньше — подтягиваем
+  // из базы (актуально для /replay, куда своих файлов при вызове не передают явно).
+  let visuals = customVisuals;
+  if (visuals === null) {
+    const { data } = await supabase.from("shorts").select("custom_visuals").eq("id", shortId).maybeSingle();
+    visuals = data?.custom_visuals || [];
+  }
+
+  await ctx.reply(`🎬 Начинаю монтаж «${title || "TikTok"}». Это может занять несколько минут...`);
+
+  // Не await — сборка идёт в фоне, не держит открытым Telegram-запрос. Это
+  // критично уже сейчас (сборка может занять несколько минут), а без этого
+  // длинные ролики (5-10 мин) вообще не смогли бы работать — Telegram решит,
+  // что вебхук не доставлен, и начнёт ретраить, пока процесс молча тянется.
+  assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, visuals)
+    .catch(async (err) => {
+      console.error("Ошибка сборки short:", err);
+      await releaseShortBuildLock(shortId, { status: "error", error: err.message });
+      await ctx.reply(`❌ Не удалось собрать TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`).catch(() => {});
+    })
+    .finally(() => releaseGenerationLock(ctx.from.id));
+}
 
 async function resumeShortFromReplay(ctx, short) {
   try {
@@ -297,26 +450,8 @@ async function resumeShortFromReplay(ctx, short) {
     ctx.session.shortDraft = { shortId: short.id, script: short.script };
     ctx.session.step = null;
 
-    const gotLock = await acquireShortBuildLock(short.id);
-    if (!gotLock) {
-      await ctx.reply(
-        `⏳ TikTok «${short.title || "без названия"}» уже собирается. Дождись завершения — второй раз запускать не буду.\n\n` +
-        `Если сборка реально зависла дольше 15 минут, пришли /replay ещё раз — лок сбросится автоматически, и эта попытка запустит сборку заново.`
-      );
-      return;
-    }
-
     await ctx.reply(`🔄 Возобновляю сборку TikTok «${short.title || "без названия"}» с сохранённой озвучкой...`);
-
-    // Не await — сборка идёт в фоне, не держит открытым Telegram-запрос. Это
-    // критично уже сейчас (сборка может занять несколько минут), а без этого
-    // длинные ролики (5-10 мин) вообще не смогли бы работать — Telegram решит,
-    // что вебхук не доставлен, и начнёт ретраить, пока процесс молча тянется.
-    assembleShortForTelegram(ctx, short.id, short.script, short.voiceover_audio_url).catch(async (err) => {
-      console.error("Ошибка /replay для short:", err);
-      await releaseShortBuildLock(short.id, { status: "error", error: err.message });
-      await ctx.reply(`❌ Не удалось продолжить TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`).catch(() => {});
-    });
+    await startShortBuild(ctx, short.id, short.script, short.voiceover_audio_url, short.title);
   } catch (err) {
     console.error("Ошибка /replay для short:", err);
     await releaseShortBuildLock(short.id, { status: "error", error: err.message });
@@ -332,7 +467,56 @@ async function resumeShortFromReplay(ctx, short) {
 // за отведённые секунды до полного завершения процесса — /replay после рестарта сработает
 // сразу, без ожидания.
 let currentlyBuildingShortId = null;
+let currentGeneration = null; // { telegramId, kind, resourceId } — для gracefulShutdown
 
+// ---------- Единый лок "одна генерация за раз" (shorts + episodes) ----------
+// Раньше у shorts был свой build_lock, а у episodes не было никакой защиты —
+// можно было одновременно затеять и TikTok, и сериал, оба одновременно грызли бы
+// те же 512MB. Теперь один общий лок на telegram_id, независимо от типа контента.
+const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000; // сериал может честно собираться дольше short'а
+
+async function acquireGenerationLock(telegramId, kind, resourceId, resourceTitle) {
+  const staleThreshold = new Date(Date.now() - GENERATION_LOCK_STALE_MS).toISOString();
+  // Снимаем зависший лок, если он старше порога (процесс, скорее всего, умер).
+  await supabase.from("generation_locks").delete().eq("telegram_id", telegramId).lt("locked_at", staleThreshold);
+
+  const { error } = await supabase
+    .from("generation_locks")
+    .insert({ telegram_id: telegramId, kind, resource_id: resourceId, resource_title: resourceTitle || null });
+
+  if (error) {
+    if (error.code === "23505") return false; // уже что-то генерируется — это не ошибка, а ожидаемый отказ
+    console.error("Ошибка при попытке взять generation lock:", error);
+    return false;
+  }
+  currentGeneration = { telegramId, kind, resourceId };
+  return true;
+}
+
+async function releaseGenerationLock(telegramId) {
+  const { error } = await supabase.from("generation_locks").delete().eq("telegram_id", telegramId);
+  if (error) console.error("Не удалось освободить generation lock:", error);
+  currentGeneration = null;
+}
+
+async function getActiveGeneration(telegramId) {
+  const { data } = await supabase.from("generation_locks").select("*").eq("telegram_id", telegramId).maybeSingle();
+  return data || null;
+}
+
+function describeActiveGeneration(lock) {
+  const kindLabel = lock.kind === "episode" ? "сериал" : "TikTok";
+  const title = lock.resource_title ? ` «${lock.resource_title}»` : "";
+  return `⏳ Сейчас уже собирается ${kindLabel}${title}. Дождись, пока он закончится, прежде чем начинать новое — одновременно бот на это не тянет.`;
+}
+
+// ---------- Мгновенное освобождение build_lock при перезапуске контейнера ----------
+// Render (особенно на бесплатном тарифе — засыпает при простое и рестартует) может
+// остановить контейнер прямо посреди сборки short'а. Раньше это обнаруживалось только
+// через 15-минутный auto-reset зависшего лока. Теперь при штатной остановке (SIGTERM,
+// её шлёт Render перед перезапуском/редеплоем) мы успеваем разблокировать текущий short
+// за отведённые секунды до полного завершения процесса — /replay после рестарта сработает
+// сразу, без ожидания.
 async function gracefulShutdown(signal) {
   console.log(`Получен ${signal} — контейнер останавливается.`);
   if (currentlyBuildingShortId) {
@@ -346,16 +530,24 @@ async function gracefulShutdown(signal) {
       console.error("Не удалось освободить build_lock при остановке:", err);
     }
   }
+  if (currentGeneration) {
+    try {
+      await releaseGenerationLock(currentGeneration.telegramId);
+    } catch (err) {
+      console.error("Не удалось освободить generation lock при остановке:", err);
+    }
+  }
   process.exit(0);
 }
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl) {
+async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, customVisuals = []) {
   currentlyBuildingShortId = shortId;
   try {
     const { localPath: finalPath, publicUrl, totalDurationSec } = await assembleShort(script, {
       voiceoverUrl,
+      customVisuals,
       onProgress: (msg) => bot.api.sendMessage(ctx.chat.id, msg),
     });
 
@@ -432,6 +624,11 @@ const videoBatchBuffers = new Map(); // telegram_id -> { videos: [...], timer, c
 const VIDEO_BATCH_DEBOUNCE_MS = 2500;
 
 bot.on("message:video", async (ctx) => {
+  if (ctx.session.step === "awaiting_custom_visuals") {
+    bufferCustomVisual(ctx, { type: "video", message: ctx.message.video });
+    return;
+  }
+
   const userId = ctx.from.id;
   let buffer = videoBatchBuffers.get(userId);
   if (!buffer) {
@@ -443,6 +640,14 @@ bot.on("message:video", async (ctx) => {
 
   if (buffer.timer) clearTimeout(buffer.timer);
   buffer.timer = setTimeout(() => processVideoBatch(userId), VIDEO_BATCH_DEBOUNCE_MS);
+});
+
+bot.on("message:photo", async (ctx) => {
+  if (ctx.session.step !== "awaiting_custom_visuals") return;
+  // Телеграм присылает несколько размеров одного фото — берём самый крупный.
+  const sizes = ctx.message.photo;
+  const largest = sizes[sizes.length - 1];
+  bufferCustomVisual(ctx, { type: "photo", message: largest });
 });
 
 async function processVideoBatch(userId) {
@@ -560,27 +765,19 @@ async function handleShortVoiceUpload(ctx) {
 
     if (updateError) throw new Error(`Не удалось сохранить озвучку: ${updateError.message}`);
 
-    // С этого момента диалоговый шаг больше не должен запускать новую сборку — судьбу
-    // сборки решает build_lock в базе. Это защищает от повторного Telegram-апдейта
-    // (тот же файл, доставленный дважды) даже если дедупликация по update_id почему-то не сработала.
-    ctx.session.step = null;
+    // Судьбу сборки дальше решает build_lock в базе, а не диалоговый шаг — это
+    // защищает от повторного Telegram-апдейта (тот же файл, доставленный дважды)
+    // даже если дедупликация по update_id почему-то не сработала.
+    ctx.session.step = "awaiting_visual_choice";
+    ctx.session.shortDraft = { shortId, script, voiceoverUrl };
 
-    const gotLock = await acquireShortBuildLock(shortId);
-    if (!gotLock) {
-      await ctx.reply("⏳ Сборка этого TikTok уже идёт. Дождись результата — второй раз запускать не буду.");
-      return true;
-    }
-
-    await ctx.reply("🎬 Начинаю монтаж. Это может занять несколько минут...");
-
-    // Не await — сборка уходит в фон, ответ Telegram-вебхуку не ждёт её завершения.
-    assembleShortForTelegram(ctx, shortId, script, voiceoverUrl).catch(async (err) => {
-      console.error("Ошибка сборки short после загрузки озвучки:", err);
-      await releaseShortBuildLock(shortId, { status: "error", error: err.message });
-      await ctx.reply(
-        `❌ Не удалось собрать TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`
-      ).catch(() => {});
-    });
+    const kb = new InlineKeyboard()
+      .text("📁 Свои фото/видео", "visuals_custom")
+      .text("🤖 Подобрать автоматически", "visuals_auto");
+    await ctx.reply(
+      `Озвучка получена (${script.segments.length} сегментов). Визуал для роликов — свой или подобрать со стоков автоматически?`,
+      { reply_markup: kb }
+    );
 
     return true;
   } catch (err) {
@@ -920,12 +1117,20 @@ async function confirmAndEstimateCredits(ctx) {
 
 bot.callbackQuery("confirm_generate", async (ctx) => {
   await safeAnswer(ctx);
+
+  const telegramId = ctx.from.id;
+  const activeLock = await getActiveGeneration(telegramId);
+  if (activeLock) {
+    await ctx.reply(describeActiveGeneration(activeLock));
+    return;
+  }
+
   await ctx.reply("Начинаю генерацию. Это займет несколько минут...");
 
   const { data: episode } = await supabase
     .from("episodes")
     .insert({
-      telegram_id: ctx.from.id,
+      telegram_id: telegramId,
       title: ctx.session.draft.script.title,
       script: ctx.session.draft.script,
       characters: ctx.session.draft.characters,
@@ -935,10 +1140,21 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
     .select()
     .single();
 
-  processEpisode(ctx, episode).catch((err) => {
-    console.error("Необработанная ошибка в processEpisode:", err);
-    ctx.reply("Что-то пошло не так во время генерации. Попробуй /new_episode заново.").catch(() => {});
-  });
+  const gotLock = await acquireGenerationLock(telegramId, "episode", episode.id, episode.title);
+  if (!gotLock) {
+    // Крайне маловероятная гонка (кто-то успел начать другую генерацию за эти
+    // миллисекунды) — эпизод уже создан в базе, но откладываем его запуск,
+    // /replay подхватит его позже.
+    await ctx.reply(describeActiveGeneration(await getActiveGeneration(telegramId)));
+    return;
+  }
+
+  processEpisode(ctx, episode)
+    .catch((err) => {
+      console.error("Необработанная ошибка в processEpisode:", err);
+      ctx.reply("Что-то пошло не так во время генерации. Попробуй /new_episode заново.").catch(() => {});
+    })
+    .finally(() => releaseGenerationLock(telegramId));
 });
 
 async function processEpisode(ctx, episode) {
@@ -1031,18 +1247,37 @@ async function processEpisode(ctx, episode) {
         }
         record = newScene;
 
-        // generateVideoScene (lib/wavespeed.js) тоже ждёт объект { referenceImageUrl, prompt },
-        // а не позиционные аргументы — раньше сюда передавались 4 позиционных значения,
-        // и внутри всё разваливалось в undefined. Плюс функция возвращает { job_id }, а
-        // не голую строку — раньше taskId был целым объектом вместо ID задачи.
-        const videoResult = await generateVideoScene({
-          referenceImageUrl: record.character_ref_image_url || undefined,
-          prompt: scene.script_text,
-        });
-        const taskId = videoResult.job_id;
-        await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing" }).eq("id", record.id);
-        record.video_job_id = taskId;
-        record.video_status = "processing";
+        if (!record.character_ref_image_url) {
+          // Без референс-картинки этот шаг видео-модели (image-to-video) в принципе
+          // не может сработать — она требует image. Раньше это падало необработанным
+          // исключением и роняло ВЕСЬ эпизод; теперь просто помечаем сцену
+          // неудачной и продолжаем с остальными — pollScenes соберёт эпизод из того,
+          // что получилось.
+          console.error(`Сцена ${sceneNumber}: нет референс-картинки, пропускаю генерацию видео.`);
+          await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
+          record.video_status = "failed";
+          continue;
+        }
+
+        try {
+          // generateVideoScene (lib/wavespeed.js) тоже ждёт объект { referenceImageUrl, prompt },
+          // а не позиционные аргументы — раньше сюда передавались 4 позиционных значения,
+          // и внутри всё разваливалось в undefined. Плюс функция возвращает { job_id }, а
+          // не голую строку — раньше taskId был целым объектом вместо ID задачи.
+          const videoResult = await generateVideoScene({
+            referenceImageUrl: record.character_ref_image_url,
+            prompt: scene.script_text,
+          });
+          const taskId = videoResult.job_id;
+          await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing" }).eq("id", record.id);
+          record.video_job_id = taskId;
+          record.video_status = "processing";
+        } catch (err) {
+          console.error(`Ошибка запуска генерации видео для сцены ${sceneNumber}:`, err.message);
+          await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
+          record.video_status = "failed";
+          continue;
+        }
       }
 
       if (scene.voiceover_text && !record.voiceover_audio_url) {
