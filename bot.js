@@ -358,11 +358,17 @@ bot.command("replay", async (ctx) => {
     return;
   }
 
+  // Раньше здесь было .eq("status", "error") — если контейнер перезапускался
+  // (SIGTERM от Render) прямо посреди генерации серии, эпизод так и оставался
+  // status="processing" навсегда (лок снимался, а статус в таблице episodes — нет),
+  // и /replay его просто не находил, притворяясь, что чинить нечего. Активная
+  // генерация уже отсекается проверкой getActiveGeneration() выше, так что
+  // "processing" здесь всегда означает зависший/прерванный эпизод, а не гонку.
   const { data: episode, error } = await supabase
     .from("episodes")
     .select("*")
     .eq("telegram_id", telegramId)
-    .eq("status", "error")
+    .in("status", ["error", "processing"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -531,6 +537,16 @@ async function gracefulShutdown(signal) {
     }
   }
   if (currentGeneration) {
+    if (currentGeneration.kind === "episode") {
+      try {
+        await supabase
+          .from("episodes")
+          .update({ status: "error", error: `Контейнер был перезапущен во время сборки (${signal}). Нажми /replay.` })
+          .eq("id", currentGeneration.resourceId);
+      } catch (err) {
+        console.error("Не удалось пометить episode как error при остановке:", err);
+      }
+    }
     try {
       await releaseGenerationLock(currentGeneration.telegramId);
     } catch (err) {
@@ -1335,12 +1351,32 @@ async function pollScenes(ctx, episodeId) {
 
       await ctx.reply("Видео сгенерировано! Начинаю сборку со звуком...");
       try {
-        const finalUrl = await assembleEpisode(validScenes, episodeId);
-        await supabase.from("episodes").update({ status: "completed", final_video_url: finalUrl }).eq("id", episodeId);
-        await ctx.reply(`Готово! Вот твой сериал:\n${finalUrl}\n\nНачать новый — /new_episode.`);
+        const { localPath: finalPath, publicUrl } = await assembleEpisode(validScenes, episodeId);
+        await supabase.from("episodes").update({ status: "completed", final_video_url: publicUrl }).eq("id", episodeId);
+
+        // Раньше сюда просто присылалась текстовая ссылка на Supabase Storage —
+        // Telegram её не разворачивал в плеер. Шлём через replyWithVideo, как
+        // и short'ы: сначала по ссылке (быстрее, не грузит исходящий канал Render),
+        // при неудаче — файлом напрямую через бота.
+        try {
+          await ctx.replyWithVideo(publicUrl, {
+            caption: "✅ Готово! Твой сериал.\n\nНачать новый — /new_episode.",
+          });
+        } catch (sendErr) {
+          console.warn("Отправка эпизода по ссылке не удалась, пробую загрузить файл напрямую:", sendErr.message);
+          await ctx.replyWithVideo(new InputFile(finalPath), {
+            caption: "✅ Готово! Твой сериал.\n\nНачать новый — /new_episode.",
+          });
+        }
+
+        try {
+          fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.warn("Не удалось очистить временные файлы эпизода:", cleanupError.message);
+        }
       } catch (err) {
         console.error("Ошибка сборки:", err);
-        await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
+        await supabase.from("episodes").update({ status: "error", error: err.message }).eq("id", episodeId);
         await ctx.reply("Видео готовы, но не получилось собрать (FFmpeg). Попробуй /replay позже.");
       }
     } else {
