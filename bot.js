@@ -24,9 +24,6 @@ import { isUrl, fetchArticle, generateShortScript } from "./lib/shorts-script.js
 import { analyzeStyleFromVideo, MAX_STYLE_VIDEO_BYTES } from "./lib/style-learning.js";
 import { assembleShort } from "./lib/shorts-assemble.js";
 
-// ДОБАВЛЕНО: Импорт функций обхода WaveSpeed
-import { step1_start, step2_finish } from "./lib/wavespeed-auth.js";
-
 // Настройка путей
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,11 +41,6 @@ function normalizeName(name) {
 }
 
 // ---------- Дедупликация Telegram update ----------
-// Render может перезапустить процесс или не ответить Telegram вовремя (сборка видео
-// занимает несколько минут) — тогда Telegram присылает ТОТ ЖЕ update повторно.
-// Без защиты это приводило к тому, что один и тот же TikTok собирался несколько раз
-// параллельно. Решение: атомарно фиксируем update_id в Supabase; если он уже есть —
-// значит апдейт уже обрабатывается/обработан, второй раз ничего не делаем.
 bot.use(async (ctx, next) => {
   const updateId = ctx.update?.update_id;
   if (updateId == null) return next();
@@ -57,11 +49,9 @@ bot.use(async (ctx, next) => {
 
   if (error) {
     if (error.code === "23505") {
-      // unique_violation — это повторная доставка одного и того же update, игнорируем.
       console.log(`Дубликат update_id=${updateId}, пропускаю повторную обработку.`);
       return;
     }
-    // Если таблицы ещё нет или Supabase недоступен — не блокируем бота, просто логируем.
     console.error("Дедупликация update не сработала (продолжаю без неё):", error.message);
   }
 
@@ -69,11 +59,7 @@ bot.use(async (ctx, next) => {
 });
 
 // ---------- Build-lock для сборки Shorts ----------
-// Один флаг в памяти процесса (let isBuilding = false) не спасает, потому что Render
-// может держать/перезапускать несколько процессов. Поэтому лок хранится в Supabase и
-// берётся ОДНИМ атомарным UPDATE: строка обновляется, только если лока ещё нет —
-// Postgres гарантирует, что при двух одновременных запросах выиграет только один.
-const BUILD_LOCK_STALE_MS = 15 * 60 * 1000; // если сборка "висит" дольше 15 минут — считаем её зависшей
+const BUILD_LOCK_STALE_MS = 15 * 60 * 1000; 
 
 async function acquireShortBuildLock(shortId) {
   const staleThreshold = new Date(Date.now() - BUILD_LOCK_STALE_MS).toISOString();
@@ -123,11 +109,69 @@ bot.use(session({
   getSessionKey: (ctx) => ctx.from?.id.toString(),
 }));
 
+
+// ---------- РОТАТОР КЛЮЧЕЙ WAVESPEED ----------
+// Эта функция оборачивает все вызовы к WaveSpeed. Если ловит ошибку баланса или ключа - 
+// автоматически меняет ключ в базе и в памяти, после чего продолжает генерацию.
+async function withKeyRotation(ctx, actionName, actionFn) {
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      // Если ключа в памяти нет (после перезапуска), пытаемся взять из базы
+      if (!process.env.WAVESPEED_API_KEY) {
+        const { data } = await supabase.from("wavespeed_keys").select("*").eq("is_active", true).limit(1).maybeSingle();
+        if (data && data.key) {
+           process.env.WAVESPEED_API_KEY = data.key;
+        }
+      }
+
+      return await actionFn();
+    } catch (err) {
+      const msg = (err.message || "").toLowerCase();
+      // Триггеры для смены ключа (ошибки авторизации, баланса, лимитов)
+      if (
+        msg.includes("balance") || 
+        msg.includes("credit") || 
+        msg.includes("unauthorized") || 
+        msg.includes("key") || 
+        msg.includes("401") || 
+        msg.includes("403") || 
+        msg.includes("insufficient") ||
+        msg.includes("images.0 failed nullable validation")
+      ) {
+        retries--;
+        const oldKey = process.env.WAVESPEED_API_KEY;
+        
+        // 1. Помечаем старый ключ как неактивный
+        if (oldKey) {
+          await supabase.from("wavespeed_keys").update({ is_active: false }).eq("key", oldKey);
+        }
+
+        // 2. Берем новый ключ
+        const { data } = await supabase.from("wavespeed_keys").select("*").eq("is_active", true).limit(1).maybeSingle();
+        
+        if (data && data.key) {
+          process.env.WAVESPEED_API_KEY = data.key;
+          if (ctx) {
+            // Пишем сообщение (если процесс быстрый, можно убрать, но для видео полезно)
+            await ctx.reply(`🔄 API ключ WaveSpeed закончился во время задачи "${actionName}". Меняю на новый из базы и продолжаю...`).catch(() => {});
+          }
+          continue; // Пробуем выполнить функцию заново
+        } else {
+          if (ctx) await ctx.reply("❌ В базе не осталось рабочих API ключей WaveSpeed! Добавь новые через команду /update_key");
+          throw new Error("Все ключи WaveSpeed израсходованы.");
+        }
+      }
+      // Если ошибка другая, прокидываем дальше
+      throw err;
+    }
+  }
+  throw new Error(`Не удалось выполнить действие "${actionName}" после нескольких попыток смены ключа.`);
+}
+// ---------------------------------------------
+
+
 // ---------- /start ----------
-// ---------- Постоянное меню (как у barber-бота на скриншоте) ----------
-// В отличие от InlineKeyboard (кнопки под одним сообщением, пропадают в истории),
-// это Reply Keyboard — висит внизу экрана всегда, пока не заменят. Два таба:
-// создание сериала и создание TikTok, без необходимости помнить слэш-команды.
 const mainMenuKeyboard = new Keyboard()
   .text("🎬 Создать сериал")
   .text("🎥 Создать TikTok")
@@ -137,8 +181,7 @@ bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету, а ещё умею делать короткие TikTok-style видео.\n\n" +
     "Выбери внизу, что хочешь сделать — 🎬 сериал или 🎥 TikTok.\n\n" +
-    "Команда `/update_key` — автоматическое обновление ключа WaveSpeed.\n" +
-    "Команда `/update_key <ключ>` — ручное обновление.\n" +
+    "Команда `/update_key` — пополнение базы API ключей WaveSpeed.\n" +
     "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось.",
     { parse_mode: "Markdown", reply_markup: mainMenuKeyboard }
   );
@@ -167,6 +210,7 @@ async function startNewShort(ctx) {
 bot.hears("🎬 Создать сериал", startNewEpisode);
 bot.hears("🎥 Создать TikTok", startNewShort);
 
+
 // ---------- Выбор визуала: свои файлы или автоподбор со стоков ----------
 bot.callbackQuery("visuals_auto", async (ctx) => {
   await safeAnswer(ctx);
@@ -193,9 +237,7 @@ bot.callbackQuery("visuals_custom", async (ctx) => {
   );
 });
 
-// Буфер для сбора своих фото/видео пачкой — та же идея, что и батч видео для
-// /learn_style (ждём тишины после последнего файла, потом обрабатываем разом).
-const customVisualBuffers = new Map(); // telegram_id -> { items: [...], timer, ctx }
+const customVisualBuffers = new Map();
 const CUSTOM_VISUAL_DEBOUNCE_MS = 2500;
 
 function bufferCustomVisual(ctx, item) {
@@ -245,7 +287,7 @@ async function processCustomVisualBatch(userId) {
       customVisuals.push({ type: item.type, url });
     } catch (err) {
       console.error("Ошибка загрузки своего визуала:", err.message);
-      customVisuals.push(null); // сегмент останется без своего файла — подберётся автоматически
+      customVisuals.push(null);
     } finally {
       try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
     }
@@ -264,75 +306,31 @@ async function processCustomVisualBatch(userId) {
   await startShortBuild(ctx, shortId, script, voiceoverUrl, script?.title, customVisuals);
 }
 
-// ---------- /new_episode ----------
 bot.command("new_episode", startNewEpisode);
 
-// ---------- ОБНОВЛЕНИЕ КЛЮЧА ----------
+
+// ---------- ОБНОВЛЕНИЕ КЛЮЧЕЙ (БАЗА ДАННЫХ) ----------
 bot.command("update_key", async (ctx) => {
-  const newKey = ctx.match ? ctx.match.trim() : "";
-
-  // Если ключ не передан вручную — запускаем автоматический обход (Playwright)
-  if (!newKey) {
-    return step1_start(bot, ctx.chat.id);
-  }
-
-  // Ручное обновление ключа через Render API
-  const renderApiKey = process.env.RENDER_API_KEY;
-  const serviceId = process.env.RENDER_SERVICE_ID; 
-
-  if (!renderApiKey || !serviceId) {
-    return ctx.reply(
-      "❌ В `process.env` не найдены `RENDER_API_KEY` или `RENDER_SERVICE_ID`!"
-    );
-  }
-
-  const statusMsg = await ctx.reply("⏳ Отправляю запрос в Render API для обновления `WAVESPEED_API_KEY`...");
-
-  try {
-    const response = await fetch(`https://api.render.com/v1/services/${serviceId}/env-vars/WAVESPEED_API_KEY`, {
-      method: "PUT",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${renderApiKey}`
-      },
-      body: JSON.stringify({ value: newKey })
-    });
-
-    if (response.ok) {
-      await ctx.api.editMessageText(
-        ctx.chat.id,
-        statusMsg.message_id,
-        "✅ **Ключ WAVESPEED_API_KEY успешно обновлен в Render!**\n\n🔄 Бот автоматически перезапускается с новым ключом (это займет около 1 минуты).",
-        { parse_mode: "Markdown" }
-      );
-    } else {
-      const errorData = await response.json().catch(() => ({ message: response.statusText }));
-      await ctx.api.editMessageText(
-        ctx.chat.id,
-        statusMsg.message_id,
-        `❌ **Ошибка Render API (${response.status}):** ${errorData.message || response.statusText}`
-      );
-    }
-  } catch (error) {
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      statusMsg.message_id,
-      "❌ Произошла ошибка при соединении с сервером Render."
-    );
-  }
+  ctx.session.step = "awaiting_api_keys";
+  await ctx.reply(
+    "🔑 Скинь API ключи WaveSpeed (можно сразу списком, каждый с новой строки).\n\n" +
+    "🔗 Ссылка на сайт: https://wavespeed.io/login\n\n" +
+    "Когда скинешь все ключи, нажми /finish_key чтобы завершить прием."
+  );
 });
 
-// ---------- ЗАВЕРШЕНИЕ ОБНОВЛЕНИЯ ----------
 bot.command("finish_key", async (ctx) => {
-  // Вызываем второй шаг автоматизации (логин в WaveSpeed и извлечение ключа)
-  await step2_finish(bot, ctx.chat.id);
+  if (ctx.session.step === "awaiting_api_keys") {
+    ctx.session.step = null;
+    await ctx.reply("✅ Прием ключей окончен. Теперь бот будет автоматически брать их из базы.");
+  } else {
+    await ctx.reply("Прием ключей сейчас и так не идет. Начни с команды /update_key.");
+  }
 });
+// ---------------------------------------------------
+
 
 // ---------- /replay ----------
-// Универсальное продолжение последней незавершённой работы:
-// 1) сначала пытаемся продолжить short;
-// 2) если short нет — продолжаем сериал.
 bot.command("replay", async (ctx) => {
   const telegramId = ctx.from.id;
 
@@ -358,12 +356,6 @@ bot.command("replay", async (ctx) => {
     return;
   }
 
-  // Раньше здесь было .eq("status", "error") — если контейнер перезапускался
-  // (SIGTERM от Render) прямо посреди генерации серии, эпизод так и оставался
-  // status="processing" навсегда (лок снимался, а статус в таблице episodes — нет),
-  // и /replay его просто не находил, притворяясь, что чинить нечего. Активная
-  // генерация уже отсекается проверкой getActiveGeneration() выше, так что
-  // "processing" здесь всегда означает зависший/прерванный эпизод, а не гонку.
   const { data: episode, error } = await supabase
     .from("episodes")
     .select("*")
@@ -395,8 +387,6 @@ bot.command("replay", async (ctx) => {
     .finally(() => releaseGenerationLock(telegramId));
 });
 
-// Общий запуск сборки short'а — используется и из /replay, и из обычного
-// флоу после получения озвучки (см. handleShortVoiceUpload и выбор своих файлов).
 async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, customVisuals = null) {
   const gotLock = await acquireShortBuildLock(shortId);
   if (!gotLock) {
@@ -414,8 +404,6 @@ async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, custom
     return;
   }
 
-  // Если своих файлов на этот short не находили/не сохраняли раньше — подтягиваем
-  // из базы (актуально для /replay, куда своих файлов при вызове не передают явно).
   let visuals = customVisuals;
   if (visuals === null) {
     const { data } = await supabase.from("shorts").select("custom_visuals").eq("id", shortId).maybeSingle();
@@ -424,10 +412,6 @@ async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, custom
 
   await ctx.reply(`🎬 Начинаю монтаж «${title || "TikTok"}». Это может занять несколько минут...`);
 
-  // Не await — сборка идёт в фоне, не держит открытым Telegram-запрос. Это
-  // критично уже сейчас (сборка может занять несколько минут), а без этого
-  // длинные ролики (5-10 мин) вообще не смогли бы работать — Telegram решит,
-  // что вебхук не доставлен, и начнёт ретраить, пока процесс молча тянется.
   assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, visuals)
     .catch(async (err) => {
       console.error("Ошибка сборки short:", err);
@@ -449,10 +433,6 @@ async function resumeShortFromReplay(ctx, short) {
       return;
     }
 
-    // Важно: НЕ выходим здесь только потому, что status === "building". Сброс
-    // зависшего лока (если сборка висит дольше 15 минут) происходит внутри
-    // acquireShortBuildLock — если просто ответить "жди" и не вызвать её, лок
-    // никогда не разблокируется через /replay, даже если процесс давно умер.
     ctx.session.shortDraft = { shortId: short.id, script: short.script };
     ctx.session.step = null;
 
@@ -465,25 +445,13 @@ async function resumeShortFromReplay(ctx, short) {
   }
 }
 
-// ---------- Мгновенное освобождение build_lock при перезапуске контейнера ----------
-// Render (особенно на бесплатном тарифе — засыпает при простое и рестартует) может
-// остановить контейнер прямо посреди сборки short'а. Раньше это обнаруживалось только
-// через 15-минутный auto-reset зависшего лока. Теперь при штатной остановке (SIGTERM,
-// её шлёт Render перед перезапуском/редеплоем) мы успеваем разблокировать текущий short
-// за отведённые секунды до полного завершения процесса — /replay после рестарта сработает
-// сразу, без ожидания.
 let currentlyBuildingShortId = null;
-let currentGeneration = null; // { telegramId, kind, resourceId } — для gracefulShutdown
+let currentGeneration = null;
 
-// ---------- Единый лок "одна генерация за раз" (shorts + episodes) ----------
-// Раньше у shorts был свой build_lock, а у episodes не было никакой защиты —
-// можно было одновременно затеять и TikTok, и сериал, оба одновременно грызли бы
-// те же 512MB. Теперь один общий лок на telegram_id, независимо от типа контента.
-const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000; // сериал может честно собираться дольше short'а
+const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000; 
 
 async function acquireGenerationLock(telegramId, kind, resourceId, resourceTitle) {
   const staleThreshold = new Date(Date.now() - GENERATION_LOCK_STALE_MS).toISOString();
-  // Снимаем зависший лок, если он старше порога (процесс, скорее всего, умер).
   await supabase.from("generation_locks").delete().eq("telegram_id", telegramId).lt("locked_at", staleThreshold);
 
   const { error } = await supabase
@@ -491,7 +459,7 @@ async function acquireGenerationLock(telegramId, kind, resourceId, resourceTitle
     .insert({ telegram_id: telegramId, kind, resource_id: resourceId, resource_title: resourceTitle || null });
 
   if (error) {
-    if (error.code === "23505") return false; // уже что-то генерируется — это не ошибка, а ожидаемый отказ
+    if (error.code === "23505") return false; 
     console.error("Ошибка при попытке взять generation lock:", error);
     return false;
   }
@@ -513,28 +481,18 @@ async function getActiveGeneration(telegramId) {
 function describeActiveGeneration(lock) {
   const kindLabel = lock.kind === "episode" ? "сериал" : "TikTok";
   const title = lock.resource_title ? ` «${lock.resource_title}»` : "";
-  return `⏳ Сейчас уже собирается ${kindLabel}${title}. Дождись, пока он закончится, прежде чем начинать новое — одновременно бот на это не тянет.`;
+  return `⏳ Сейчас уже собирается ${kindLabel}${title}. Дождись, пока он закончится, прежде чем начинать новое.`;
 }
 
-// ---------- Мгновенное освобождение build_lock при перезапуске контейнера ----------
-// Render (особенно на бесплатном тарифе — засыпает при простое и рестартует) может
-// остановить контейнер прямо посреди сборки short'а. Раньше это обнаруживалось только
-// через 15-минутный auto-reset зависшего лока. Теперь при штатной остановке (SIGTERM,
-// её шлёт Render перед перезапуском/редеплоем) мы успеваем разблокировать текущий short
-// за отведённые секунды до полного завершения процесса — /replay после рестарта сработает
-// сразу, без ожидания.
 async function gracefulShutdown(signal) {
   console.log(`Получен ${signal} — контейнер останавливается.`);
   if (currentlyBuildingShortId) {
-    console.log(`Освобождаю build_lock для short ${currentlyBuildingShortId} перед выходом...`);
     try {
       await releaseShortBuildLock(currentlyBuildingShortId, {
         status: "error",
         error: `Контейнер был перезапущен во время сборки (${signal}). Нажми /replay.`,
       });
-    } catch (err) {
-      console.error("Не удалось освободить build_lock при остановке:", err);
-    }
+    } catch (err) {}
   }
   if (currentGeneration) {
     if (currentGeneration.kind === "episode") {
@@ -543,15 +501,11 @@ async function gracefulShutdown(signal) {
           .from("episodes")
           .update({ status: "error", error: `Контейнер был перезапущен во время сборки (${signal}). Нажми /replay.` })
           .eq("id", currentGeneration.resourceId);
-      } catch (err) {
-        console.error("Не удалось пометить episode как error при остановке:", err);
-      }
+      } catch (err) {}
     }
     try {
       await releaseGenerationLock(currentGeneration.telegramId);
-    } catch (err) {
-      console.error("Не удалось освободить generation lock при остановке:", err);
-    }
+    } catch (err) {}
   }
   process.exit(0);
 }
@@ -576,11 +530,6 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, cust
     ctx.session.step = null;
     ctx.session.shortDraft = {};
 
-    // Отдаём Telegram ПУБЛИЧНУЮ ССЫЛКУ, а не байты файла через себя — их сервера
-    // сами скачают видео с Supabase Storage напрямую, это быстро и не зависит от
-    // (обычно урезанной на бесплатных тарифах) исходящей скорости Render. Раньше
-    // здесь был InputFile(finalPath), то есть загрузка ЧЕРЕЗ бота — на медленном
-    // канале именно это упиралось в таймаут sendVideo на 500 секунд.
     try {
       await ctx.replyWithVideo(publicUrl, {
         caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
@@ -592,18 +541,14 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, cust
       });
     }
 
-    // После отправки видео удаляем временную папку сборки, чтобы Render не забивал диск.
     try {
       fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
-    } catch (cleanupError) {
-      console.warn("Не удалось очистить временные файлы short:", cleanupError.message);
-    }
+    } catch (cleanupError) {}
   } finally {
     currentlyBuildingShortId = null;
   }
 }
 
-// ---------- /new_episode ----------
 bot.callbackQuery("draft_yes", async (ctx) => {
   ctx.session.step = "awaiting_draft_text";
   await safeAnswer(ctx);
@@ -616,14 +561,8 @@ bot.callbackQuery("draft_no", async (ctx) => {
   await ctx.reply("Опиши тему/жанр для сериала (например: 'комедия про аэропорт').");
 });
 
-// ---------- /new_short ----------
 bot.command("new_short", startNewShort);
 
-// ---------- /learn_style — анализ референсных видео (можно пачкой/альбомом) ----------
-// Никакого выбора стиля перед каждым /new_short: всё, что бот разобрал через
-// /learn_style, копится в short_styles и автоматически подмешивается в промпт
-// генерации сценария (см. runShortPipeline ниже) — просто "общее знание" стиля,
-// без отдельного шага выбора.
 bot.command("learn_style", async (ctx) => {
   await ctx.reply(
     "Пришли сюда одно или несколько видео файлом (можно сразу пачкой/альбомом, не по одному) — " +
@@ -632,11 +571,7 @@ bot.command("learn_style", async (ctx) => {
   );
 });
 
-// Буфер для группировки видео, присланных пачкой (альбомом) или просто одно за
-// другим быстро: ждём VIDEO_BATCH_DEBOUNCE_MS тишины после последнего видео и
-// только потом обрабатываем всё разом, чтобы не заваливать пользователя
-// отдельным отчётом на каждый файл.
-const videoBatchBuffers = new Map(); // telegram_id -> { videos: [...], timer, ctx }
+const videoBatchBuffers = new Map();
 const VIDEO_BATCH_DEBOUNCE_MS = 2500;
 
 bot.on("message:video", async (ctx) => {
@@ -652,7 +587,7 @@ bot.on("message:video", async (ctx) => {
     videoBatchBuffers.set(userId, buffer);
   }
   buffer.videos.push(ctx.message.video);
-  buffer.ctx = ctx; // берём самый свежий ctx, чтобы отвечать в актуальный чат
+  buffer.ctx = ctx; 
 
   if (buffer.timer) clearTimeout(buffer.timer);
   buffer.timer = setTimeout(() => processVideoBatch(userId), VIDEO_BATCH_DEBOUNCE_MS);
@@ -660,7 +595,6 @@ bot.on("message:video", async (ctx) => {
 
 bot.on("message:photo", async (ctx, next) => {
   if (ctx.session.step !== "awaiting_custom_visuals") return next();
-  // Телеграм присылает несколько размеров одного фото — берём самый крупный.
   const sizes = ctx.message.photo;
   const largest = sizes[sizes.length - 1];
   bufferCustomVisual(ctx, { type: "photo", message: largest });
@@ -723,7 +657,6 @@ async function processVideoBatch(userId) {
   await ctx.reply(reply);
 }
 
-// ---------- Озвучка для /new_short ----------
 async function handleShortVoiceUpload(ctx) {
   if (ctx.session.step !== "awaiting_short_voice" || !ctx.session.shortDraft?.shortId) return false;
 
@@ -759,7 +692,6 @@ async function handleShortVoiceUpload(ctx) {
   try {
     await ctx.reply("🎙️ Озвучка получена! Скачиваю файл...");
 
-    // В grammY File нет метода download(). Скачиваем файл через Telegram Bot API.
     const file = await ctx.api.getFile(message.audio?.file_id || message.document?.file_id);
     if (!file.file_path) throw new Error("Telegram не вернул путь к файлу озвучки.");
 
@@ -781,9 +713,6 @@ async function handleShortVoiceUpload(ctx) {
 
     if (updateError) throw new Error(`Не удалось сохранить озвучку: ${updateError.message}`);
 
-    // Судьбу сборки дальше решает build_lock в базе, а не диалоговый шаг — это
-    // защищает от повторного Telegram-апдейта (тот же файл, доставленный дважды)
-    // даже если дедупликация по update_id почему-то не сработала.
     ctx.session.step = "awaiting_visual_choice";
     ctx.session.shortDraft = { shortId, script, voiceoverUrl };
 
@@ -798,19 +727,11 @@ async function handleShortVoiceUpload(ctx) {
     return true;
   } catch (err) {
     console.error("Ошибка сборки short после загрузки озвучки:", err);
-
     await releaseShortBuildLock(shortId, { status: "error", error: err.message });
-
-    await ctx.reply(
-      `❌ Не удалось собрать TikTok.\n\n` +
-      `${err.message}\n\n` +
-      `Нажми /replay, чтобы попробовать ещё раз.`
-    );
+    await ctx.reply(`❌ Не удалось собрать TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`);
     return true;
   } finally {
-    try {
-      fs.rmSync(workDir, { recursive: true, force: true });
-    } catch {}
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -827,6 +748,18 @@ bot.on("message:text", async (ctx, next) => {
   if (ctx.message.text.startsWith("/")) return next();
 
   const step = ctx.session.step;
+
+  // НОВЫЙ БЛОК ПРИЕМА КЛЮЧЕЙ WAVESPEED
+  if (step === "awaiting_api_keys") {
+    const keys = ctx.message.text.split("\n").map(k => k.trim()).filter(Boolean);
+    let added = 0;
+    for (const key of keys) {
+      const { error } = await supabase.from("wavespeed_keys").insert({ key, is_active: true });
+      if (!error) added++;
+    }
+    await ctx.reply(`✅ Сохранил ключей: ${added}. Можешь кидать еще или жми /finish_key для завершения.`);
+    return;
+  }
 
   if (step === "awaiting_draft_text" || step === "awaiting_theme") {
     const isDraft = step === "awaiting_draft_text";
@@ -875,12 +808,8 @@ bot.on("message:text", async (ctx, next) => {
 });
 
 async function runShortPipeline(ctx, rawInput) {
-  const chatId = ctx.chat.id;
   let script;
 
-  // Подмешиваем накопленный стиль автоматически, без выбора — всё, что разобрано
-  // через /learn_style, работает как общее "знание" стиля, берём последние 5,
-  // чтобы не раздувать промпт до бесконечности.
   const { data: learnedStyles } = await supabase
     .from("short_styles")
     .select("style_profile")
@@ -910,7 +839,6 @@ async function runShortPipeline(ctx, rawInput) {
     return;
   }
 
-  // Склеиваем сценарий в один чистый текст без цифр
   const cleanScript = script.segments.map(s => s.narration).join(" ");
 
   const { data: shortRecord, error: insertError } = await supabase
@@ -1004,12 +932,13 @@ bot.callbackQuery("chars_ai", async (ctx) => {
   await safeAnswer(ctx);
   await ctx.reply("Генерирую всех персонажей по описанию из сценария...");
   try {
-    const characters = await generateCharacterImages(ctx.session.draft.script.characters);
+    // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+    const characters = await withKeyRotation(ctx, "генерация персонажей", () => generateCharacterImages(ctx.session.draft.script.characters));
     ctx.session.draft.characters = characters;
     await confirmAndEstimateCredits(ctx);
   } catch (err) {
     console.error("Ошибка генерации персонажей:", err);
-    await ctx.reply("WaveSpeed не ответил. Попробуй `/update_key` для обновления токена, либо пришли фото вручную.", { parse_mode: "Markdown" });
+    await ctx.reply("WaveSpeed не ответил (или закончились ключи).", { parse_mode: "Markdown" });
   }
 });
 
@@ -1085,10 +1014,11 @@ bot.command("done", async (ctx) => {
   if (missing.length > 0) {
     await ctx.reply(`Генерирую недостающих персонажей (${missing.map((c) => c.name).join(", ")})...`);
     try {
-      const generated = await generateCharacterImages(missing);
+      // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+      const generated = await withKeyRotation(ctx, "недостающие персонажи", () => generateCharacterImages(missing));
       ctx.session.draft.characters.push(...generated);
     } catch (err) {
-      await ctx.reply("WaveSpeed не ответил. Пришли фото для оставшихся вручную.");
+      await ctx.reply("Ошибка генерации. Пришли фото для оставшихся вручную.");
       return;
     }
   }
@@ -1110,7 +1040,9 @@ async function confirmAndEstimateCredits(ctx) {
     });
 
     let balance = null;
-    try { balance = await checkBalance(); } catch (err) {}
+    try { 
+      balance = await withKeyRotation(ctx, "проверка баланса", checkBalance); 
+    } catch (err) {}
 
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
@@ -1118,7 +1050,7 @@ async function confirmAndEstimateCredits(ctx) {
     let balanceLine = "";
     if (balance !== null) {
       balanceLine = `\nБаланс WaveSpeed: $${balance.toFixed(2)}.`;
-      if (balance < estimatedCost) balanceLine += `\n⚠️ Баланса может не хватить на весь эпизод. Воспользуйся \`/update_key\` для смены аккаунта.`;
+      if (balance < estimatedCost) balanceLine += `\n⚠️ Баланса может не хватить на весь эпизод, но бот сам переключит ключ, если они есть в базе.`;
     }
 
     await ctx.reply(
@@ -1158,9 +1090,6 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
 
   const gotLock = await acquireGenerationLock(telegramId, "episode", episode.id, episode.title);
   if (!gotLock) {
-    // Крайне маловероятная гонка (кто-то успел начать другую генерацию за эти
-    // миллисекунды) — эпизод уже создан в базе, но откладываем его запуск,
-    // /replay подхватит его позже.
     await ctx.reply(describeActiveGeneration(await getActiveGeneration(telegramId)));
     return;
   }
@@ -1186,12 +1115,9 @@ async function processEpisode(ctx, episode) {
     await ctx.reply(`Готовлю фон для локаций (${missingLocations.map((l) => l.name).join(", ")})...`);
     for (const loc of missingLocations) {
       try {
-        loc.image_url = await generateLocationImage(loc.description);
+        // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+        loc.image_url = await withKeyRotation(ctx, `фон локации "${loc.name}"`, () => generateLocationImage(loc.description));
       } catch (err) {
-        // Раньше ошибка тут проглатывалась молча (catch (err) {}) — фон оставался
-        // null, и это всплывало только позже непонятной ошибкой WaveSpeed
-        // "images.0 failed nullable validation" при генерации сцены. Теперь видно
-        // сразу, что и почему не получилось.
         console.error(`Не удалось сгенерировать фон локации "${loc.name}":`, err.message);
         await ctx.reply(`⚠️ Не получилось сгенерировать фон для локации "${loc.name}": ${err.message}`);
       }
@@ -1204,9 +1130,6 @@ async function processEpisode(ctx, episode) {
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
   let voiceoverFailWarned = false;
 
-  // Схема сценария использует primary_character/secondary_characters вместо единого
-  // character_names — этот хелпер просто собирает их в один список для мест, где
-  // нужны "все персонажи сцены" (референс-фото, озвучка).
   const sceneCharacterNames = (scene) =>
     [scene.primary_character, ...(scene.secondary_characters || [])].filter(Boolean);
 
@@ -1218,8 +1141,6 @@ async function processEpisode(ctx, episode) {
 
       let record = existingByNumber.get(sceneNumber);
       if (!record) {
-        // Собираем ссылки на референс-фото персонажей сцены заранее — они нужны
-        // и для генерации референса сцены, и чуть ниже для генерации видео.
         const charRefs = sceneCharacterNames(scene)
           .map((n) => characters.find((c) => c.name === n)?.ref_image_url)
           .filter(Boolean);
@@ -1233,15 +1154,12 @@ async function processEpisode(ctx, episode) {
             throw new Error(`Фон локации "${scene.location}" не готов (не сгенерировался ранее) — пропускаю референс для этой сцены.`);
           }
 
-          // generateSceneReferenceImage (lib/wavespeed.js) ждёт позиционные аргументы,
-          // а не объект с именованными полями — раньше здесь передавался объект, и
-          // внутри функции characterImageUrls оказывался undefined, что падало с
-          // "characterImageUrls is not iterable" при попытке ...characterImageUrls.
-          referenceImageUrl = await generateSceneReferenceImage(
+          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+          referenceImageUrl = await withKeyRotation(ctx, `референс сцены ${sceneNumber}`, () => generateSceneReferenceImage(
             locationImageUrl,
             charRefs,
             scene.character_position || "in the scene"
-          );
+          ));
         } catch (err) {
           console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
         }
@@ -1264,11 +1182,6 @@ async function processEpisode(ctx, episode) {
         record = newScene;
 
         if (!record.character_ref_image_url) {
-          // Без референс-картинки этот шаг видео-модели (image-to-video) в принципе
-          // не может сработать — она требует image. Раньше это падало необработанным
-          // исключением и роняло ВЕСЬ эпизод; теперь просто помечаем сцену
-          // неудачной и продолжаем с остальными — pollScenes соберёт эпизод из того,
-          // что получилось.
           console.error(`Сцена ${sceneNumber}: нет референс-картинки, пропускаю генерацию видео.`);
           await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
           record.video_status = "failed";
@@ -1276,14 +1189,11 @@ async function processEpisode(ctx, episode) {
         }
 
         try {
-          // generateVideoScene (lib/wavespeed.js) тоже ждёт объект { referenceImageUrl, prompt },
-          // а не позиционные аргументы — раньше сюда передавались 4 позиционных значения,
-          // и внутри всё разваливалось в undefined. Плюс функция возвращает { job_id }, а
-          // не голую строку — раньше taskId был целым объектом вместо ID задачи.
-          const videoResult = await generateVideoScene({
+          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+          const videoResult = await withKeyRotation(ctx, `видео для сцены ${sceneNumber}`, () => generateVideoScene({
             referenceImageUrl: record.character_ref_image_url,
             prompt: scene.script_text,
-          });
+          }));
           const taskId = videoResult.job_id;
           await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing" }).eq("id", record.id);
           record.video_job_id = taskId;
@@ -1300,8 +1210,9 @@ async function processEpisode(ctx, episode) {
         try {
           const speakerName = sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
-
-          const audioUrl = await generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || "");
+          
+          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+          const audioUrl = await withKeyRotation(ctx, `озвучка сцены ${sceneNumber}`, () => generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || ""));
 
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
@@ -1319,7 +1230,7 @@ async function processEpisode(ctx, episode) {
   } catch (error) {
     console.error("Критическая ошибка в processEpisode:", error);
     await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply("Генерация прервалась из-за ошибки. Ты можешь возобновить её с помощью /replay.");
+    await ctx.reply("Генерация прервалась из-за ошибки (возможно закончились ключи). Возобнови её с помощью /replay.");
   }
 }
 
@@ -1354,10 +1265,6 @@ async function pollScenes(ctx, episodeId) {
         const { localPath: finalPath, publicUrl } = await assembleEpisode(validScenes, episodeId);
         await supabase.from("episodes").update({ status: "completed", final_video_url: publicUrl }).eq("id", episodeId);
 
-        // Раньше сюда просто присылалась текстовая ссылка на Supabase Storage —
-        // Telegram её не разворачивал в плеер. Шлём через replyWithVideo, как
-        // и short'ы: сначала по ссылке (быстрее, не грузит исходящий канал Render),
-        // при неудаче — файлом напрямую через бота.
         try {
           await ctx.replyWithVideo(publicUrl, {
             caption: "✅ Готово! Твой сериал.\n\nНачать новый — /new_episode.",
@@ -1371,9 +1278,7 @@ async function pollScenes(ctx, episodeId) {
 
         try {
           fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
-        } catch (cleanupError) {
-          console.warn("Не удалось очистить временные файлы эпизода:", cleanupError.message);
-        }
+        } catch (cleanupError) {}
       } catch (err) {
         console.error("Ошибка сборки:", err);
         await supabase.from("episodes").update({ status: "error", error: err.message }).eq("id", episodeId);
@@ -1383,11 +1288,9 @@ async function pollScenes(ctx, episodeId) {
       for (const scene of pending) {
         if (!scene.video_job_id) continue;
         try {
-          const status = await checkVideoStatus(scene.video_job_id);
-          // checkVideoStatus (lib/wavespeed.js) возвращает { done, video_url } или
-          // { done: false, error: true/false } — раньше здесь проверялось несуществующее
-          // поле status.status === "COMPLETED"/"FAILED", которое никогда не совпадало,
-          // и сцена вечно висела в "processing", а pollScenes не завершался никогда.
+          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
+          const status = await withKeyRotation(ctx, `проверка статуса сцены ${scene.scene_number}`, () => checkVideoStatus(scene.video_job_id));
+          
           if (status.done) {
             await supabase.from("scenes").update({ video_status: "completed", video_url: status.video_url }).eq("id", scene.id);
             await ctx.reply(`✅ Сцена ${scene.scene_number} готова!`);
@@ -1395,7 +1298,6 @@ async function pollScenes(ctx, episodeId) {
             await supabase.from("scenes").update({ video_status: "failed" }).eq("id", scene.id);
             await ctx.reply(`❌ Ошибка генерации сцены ${scene.scene_number}.`);
           }
-          // иначе — ещё генерируется, ничего не делаем, проверим на следующем цикле опроса
         } catch (err) {
           console.error(`Ошибка проверки сцены ${scene.id}:`, err);
         }
