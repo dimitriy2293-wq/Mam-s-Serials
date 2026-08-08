@@ -642,8 +642,8 @@ bot.on("message:video", async (ctx) => {
   buffer.timer = setTimeout(() => processVideoBatch(userId), VIDEO_BATCH_DEBOUNCE_MS);
 });
 
-bot.on("message:photo", async (ctx) => {
-  if (ctx.session.step !== "awaiting_custom_visuals") return;
+bot.on("message:photo", async (ctx, next) => {
+  if (ctx.session.step !== "awaiting_custom_visuals") return next();
   // Телеграм присылает несколько размеров одного фото — берём самый крупный.
   const sizes = ctx.message.photo;
   const largest = sizes[sizes.length - 1];
