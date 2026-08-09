@@ -1204,7 +1204,7 @@ async function processEpisode(ctx, episode) {
             prompt: scene.script_text,
           }));
           const taskId = videoResult.job_id;
-          await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing" }).eq("id", record.id);
+          await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", record.id);
           record.video_job_id = taskId;
           record.video_status = "processing";
         } catch (err) {
@@ -1243,14 +1243,70 @@ async function processEpisode(ctx, episode) {
   }
 }
 
+// Если сцена висит в processing дольше этого — считаем джобу утерянной
+// (например, контейнер перезапускался, пока WaveSpeed её выполнял, и мы
+// потеряли связь с job_id) и не держим весь эпизод в заложниках вечно.
+const SCENE_STUCK_TIMEOUT_MS = 15 * 60 * 1000;
+
 async function pollScenes(ctx, episodeId) {
   let isDone = false;
   let compositeWarned = false;
+  let cycle = 0;
+  const startedAt = Date.now();
 
   while (!isDone) {
     await new Promise((res) => setTimeout(res, 30_000));
+    cycle++;
     const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
+
+    // Сцены, которые висят в processing дольше SCENE_STUCK_TIMEOUT_MS, считаем
+    // зависшими. Раньше сразу списывали в failed — по просьбе даём ещё один
+    // шанс: перезапускаем генерацию видео с тем же референсом (retry_count
+    // отслеживает, что доп. попытка уже была использована, чтобы не ретраить
+    // одну и ту же сцену бесконечно). Если и повтор завис — тогда уже failed.
+    for (const s of scenes) {
+      if (s.video_status !== "processing") continue;
+      const attemptStart = new Date(s.last_attempt_at || s.created_at).getTime();
+      if (Date.now() - attemptStart <= SCENE_STUCK_TIMEOUT_MS) continue;
+
+      if (s.retry_count < 1 && s.character_ref_image_url) {
+        try {
+          await ctx.reply(`🔁 Сцена ${s.scene_number} зависла — пробую сгенерировать её ещё раз.`).catch(() => {});
+          const retryResult = await withKeyRotation(ctx, `повтор видео для сцены ${s.scene_number}`, () => generateVideoScene({
+            referenceImageUrl: s.character_ref_image_url,
+            prompt: s.script_text,
+          }));
+          await supabase.from("scenes").update({
+            video_job_id: retryResult.job_id,
+            video_status: "processing",
+            retry_count: s.retry_count + 1,
+            last_attempt_at: new Date().toISOString(),
+          }).eq("id", s.id);
+          s.video_job_id = retryResult.job_id;
+          s.last_attempt_at = new Date().toISOString();
+          s.retry_count += 1;
+          continue; // даём этой попытке свои полные 15 минут, сцена остаётся "processing"
+        } catch (err) {
+          console.error(`Не удалось перезапустить сцену ${s.scene_number} после зависания:`, err.message);
+          // падаем в failed ниже
+        }
+      }
+
+      await supabase.from("scenes").update({ video_status: "failed" }).eq("id", s.id);
+      s.video_status = "failed";
+      await ctx.reply(`⌛ Сцена ${s.scene_number} не ответила даже после повтора — пропускаю её, собираю эпизод без неё.`).catch(() => {});
+    }
+
     const pending = scenes.filter((s) => s.video_status === "processing" || s.video_status === "pending");
+
+    // Раньше в это время (пока идёт wan-2.2/i2v-720p — он заметно медленнее
+    // ultra-fast) бот молчал полностью, и со стороны это выглядело как
+    // "сломалось". Раз в ~2 минуты (каждые 4 цикла по 30с) шлём короткий
+    // heartbeat, чтобы было видно, что процесс жив и просто ждёт WaveSpeed.
+    if (pending.length > 0 && cycle % 4 === 0) {
+      const minutesElapsed = Math.round((Date.now() - startedAt) / 60000);
+      await ctx.reply(`⏳ Ещё генерирую: осталось сцен — ${pending.length}. Прошло ~${minutesElapsed} мин.`).catch(() => {});
+    }
 
     if (pending.length === 0) {
       isDone = true;

@@ -21,6 +21,8 @@ create table scenes (
   video_url text,
   voiceover_audio_url text,
   duration_sec int not null,
+  retry_count int not null default 0,
+  last_attempt_at timestamptz,
   created_at timestamptz not null default now()
 );
 
