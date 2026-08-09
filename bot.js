@@ -340,6 +340,11 @@ bot.command("replay", async (ctx) => {
     return;
   }
 
+  // Раньше здесь short проверялся ПЕРВЫМ и безусловно — если у тебя когда-то
+  // завис старый TikTok, /replay возвращался к нему навсегда, даже если ты
+  // сейчас работаешь над сериалом и именно он прервался последним. Теперь
+  // берём оба кандидата и сравниваем по created_at — резюмируем то, что
+  // реально начиналось позже.
   const { data: short, error: shortError } = await supabase
     .from("shorts")
     .select("*")
@@ -351,12 +356,7 @@ bot.command("replay", async (ctx) => {
 
   if (shortError) console.error("Ошибка поиска short для /replay:", shortError);
 
-  if (short) {
-    await resumeShortFromReplay(ctx, short);
-    return;
-  }
-
-  const { data: episode, error } = await supabase
+  const { data: episode, error: episodeError } = await supabase
     .from("episodes")
     .select("*")
     .eq("telegram_id", telegramId)
@@ -365,8 +365,17 @@ bot.command("replay", async (ctx) => {
     .limit(1)
     .maybeSingle();
 
-  if (error || !episode) {
+  if (episodeError) console.error("Ошибка поиска episode для /replay:", episodeError);
+
+  if (!short && !episode) {
     await ctx.reply("Не получилось найти незавершённую задачу для повтора. Попробуй /new_short или /new_episode.");
+    return;
+  }
+
+  const resumeShort = short && (!episode || new Date(short.created_at) > new Date(episode.created_at));
+
+  if (resumeShort) {
+    await resumeShortFromReplay(ctx, short);
     return;
   }
 
