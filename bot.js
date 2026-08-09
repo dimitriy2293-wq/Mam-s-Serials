@@ -1332,5 +1332,8 @@ app.listen(PORT, async () => {
   if (publicUrl) {
     await bot.api.setWebhook(publicUrl);
     console.log("Webhook set to", publicUrl);
+  } else {
+    bot.start(); 
+    console.log("Started long polling mode");
   }
 });
