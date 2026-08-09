@@ -396,6 +396,33 @@ bot.command("replay", async (ctx) => {
     .finally(() => releaseGenerationLock(telegramId));
 });
 
+// ---------- /cancel ----------
+bot.command("cancel", async (ctx) => {
+  const telegramId = ctx.from.id;
+  const activeLock = await getActiveGeneration(telegramId);
+
+  if (!activeLock) {
+    await ctx.reply("Сейчас ничего не генерируется — отменять нечего.");
+    return;
+  }
+
+  // Кладём resource_id в cancelledResources ДО освобождения лока — циклы
+  // генерации (processEpisode, pollScenes, сборка short'а) проверяют это
+  // множество между шагами и сами остановятся на ближайшей проверке. Уже
+  // отправленный в WaveSpeed единичный запрос долетит и потратится (это
+  // деньги, которые не вернуть), но дальше по цепочке бот не пойдёт.
+  cancelledResources.add(activeLock.resource_id);
+
+  if (activeLock.kind === "episode") {
+    await supabase.from("episodes").update({ status: "error", error: "Остановлено пользователем через /cancel." }).eq("id", activeLock.resource_id);
+  } else {
+    await supabase.from("shorts").update({ status: "error", error: "Остановлено пользователем через /cancel.", build_lock: false }).eq("id", activeLock.resource_id);
+  }
+
+  await releaseGenerationLock(telegramId);
+  await ctx.reply("🛑 Останавливаю текущую генерацию. Уже запущенный к WaveSpeed запрос может доработать в фоне, но бот дальше по нему ничего делать не будет. Начать заново — /new_short или /new_episode.");
+});
+
 async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, customVisuals = null) {
   const gotLock = await acquireShortBuildLock(shortId);
   if (!gotLock) {
@@ -456,6 +483,9 @@ async function resumeShortFromReplay(ctx, short) {
 
 let currentlyBuildingShortId = null;
 let currentGeneration = null;
+// Резервируем ID отменённых episode/short — циклы генерации проверяют это
+// множество между шагами и останавливаются, если /cancel был вызван.
+const cancelledResources = new Set();
 
 const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000; 
 
@@ -1144,6 +1174,11 @@ async function processEpisode(ctx, episode) {
 
   try {
     for (let i = 0; i < scenes.length; i++) {
+      if (cancelledResources.has(episode.id)) {
+        cancelledResources.delete(episode.id);
+        console.log(`Эпизод ${episode.id} остановлен через /cancel, прерываю цикл сцен.`);
+        return;
+      }
       const scene = scenes[i];
       const sceneNumber = i + 1;
       await ctx.reply(`Сцена ${sceneNumber}/${scenes.length}: ${scene.script_text}`);
@@ -1167,7 +1202,8 @@ async function processEpisode(ctx, episode) {
           referenceImageUrl = await withKeyRotation(ctx, `референс сцены ${sceneNumber}`, () => generateSceneReferenceImage(
             locationImageUrl,
             charRefs,
-            scene.character_position || "in the scene"
+            scene.character_position || "in the scene",
+            scene.shot_type || "medium close-up"
           ));
         } catch (err) {
           console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
@@ -1182,6 +1218,7 @@ async function processEpisode(ctx, episode) {
             video_status: "pending",
             character_ref_image_url: referenceImageUrl,
             duration_sec: scene.duration_sec || 5,
+            shot_type: scene.shot_type || "medium close-up",
           })
           .select().single();
 
@@ -1202,6 +1239,7 @@ async function processEpisode(ctx, episode) {
           const videoResult = await withKeyRotation(ctx, `видео для сцены ${sceneNumber}`, () => generateVideoScene({
             referenceImageUrl: record.character_ref_image_url,
             prompt: scene.script_text,
+            shotType: scene.shot_type || "medium close-up",
           }));
           const taskId = videoResult.job_id;
           await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", record.id);
@@ -1257,6 +1295,13 @@ async function pollScenes(ctx, episodeId) {
   while (!isDone) {
     await new Promise((res) => setTimeout(res, 30_000));
     cycle++;
+
+    if (cancelledResources.has(episodeId)) {
+      cancelledResources.delete(episodeId);
+      console.log(`Эпизод ${episodeId} остановлен через /cancel, прерываю опрос сцен.`);
+      return;
+    }
+
     const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
 
     // Сцены, которые висят в processing дольше SCENE_STUCK_TIMEOUT_MS, считаем
@@ -1275,6 +1320,7 @@ async function pollScenes(ctx, episodeId) {
           const retryResult = await withKeyRotation(ctx, `повтор видео для сцены ${s.scene_number}`, () => generateVideoScene({
             referenceImageUrl: s.character_ref_image_url,
             prompt: s.script_text,
+            shotType: s.shot_type || "medium close-up",
           }));
           await supabase.from("scenes").update({
             video_job_id: retryResult.job_id,

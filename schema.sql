@@ -23,6 +23,7 @@ create table scenes (
   duration_sec int not null,
   retry_count int not null default 0,
   last_attempt_at timestamptz,
+  shot_type text,
   created_at timestamptz not null default now()
 );
 
