@@ -1255,7 +1255,14 @@ async function processEpisode(ctx, episode) {
 
       if (scene.voiceover_text && !record.voiceover_audio_url) {
         try {
-          const speakerName = sceneCharacterNames(scene)[0] || null;
+          // РАНЬШЕ голос всегда брался по primary_character сцены — а это тот,
+          // кто "в фокусе кадра", не обязательно тот, кто говорит реплику.
+          // Если крупным планом лицо слушающего, а озвучка — реплика собеседника
+          // за кадром, голос подбирался под неправильного персонажа (отсюда и
+          // "мужику женский голос"). Теперь берём явное поле scene.speaker из
+          // сценария; на старых эпизодах (сгенерированных до этого фикса, где
+          // speaker ещё нет) откатываемся на primary_character как раньше.
+          const speakerName = scene.speaker || sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
           
           // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
