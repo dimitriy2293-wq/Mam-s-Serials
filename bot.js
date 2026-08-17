@@ -13,7 +13,6 @@ import {
   generateVideoScene,
   generateVoiceoverWaveSpeed,
   checkVideoStatus,
-  checkBalance,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
 } from "./lib/wavespeed.js";
@@ -109,68 +108,6 @@ bot.use(session({
   getSessionKey: (ctx) => ctx.from?.id.toString(),
 }));
 
-
-// ---------- РОТАТОР КЛЮЧЕЙ WAVESPEED ----------
-// Эта функция оборачивает все вызовы к WaveSpeed. Если ловит ошибку баланса или ключа - 
-// автоматически меняет ключ в базе и в памяти, после чего продолжает генерацию.
-async function withKeyRotation(ctx, actionName, actionFn) {
-  let retries = 3;
-  while (retries > 0) {
-    try {
-      // Если ключа в памяти нет (после перезапуска), пытаемся взять из базы
-      if (!process.env.WAVESPEED_API_KEY) {
-        const { data } = await supabase.from("wavespeed_keys").select("*").eq("is_active", true).limit(1).maybeSingle();
-        if (data && data.key) {
-           process.env.WAVESPEED_API_KEY = data.key;
-        }
-      }
-
-      return await actionFn();
-    } catch (err) {
-      const msg = (err.message || "").toLowerCase();
-      // Триггеры для смены ключа (ошибки авторизации, баланса, лимитов)
-      if (
-        msg.includes("balance") || 
-        msg.includes("credit") || 
-        msg.includes("unauthorized") || 
-        msg.includes("key") || 
-        msg.includes("401") || 
-        msg.includes("403") || 
-        msg.includes("insufficient") ||
-        msg.includes("images.0 failed nullable validation")
-      ) {
-        retries--;
-        const oldKey = process.env.WAVESPEED_API_KEY;
-        
-        // 1. Помечаем старый ключ как неактивный
-        if (oldKey) {
-          await supabase.from("wavespeed_keys").update({ is_active: false }).eq("key", oldKey);
-        }
-
-        // 2. Берем новый ключ
-        const { data } = await supabase.from("wavespeed_keys").select("*").eq("is_active", true).limit(1).maybeSingle();
-        
-        if (data && data.key) {
-          process.env.WAVESPEED_API_KEY = data.key;
-          if (ctx) {
-            // Пишем сообщение (если процесс быстрый, можно убрать, но для видео полезно)
-            await ctx.reply(`🔄 API ключ WaveSpeed закончился во время задачи "${actionName}". Меняю на новый из базы и продолжаю...`).catch(() => {});
-          }
-          continue; // Пробуем выполнить функцию заново
-        } else {
-          if (ctx) await ctx.reply("❌ В базе не осталось рабочих API ключей WaveSpeed! Добавь новые через команду /update_key");
-          throw new Error("Все ключи WaveSpeed израсходованы.");
-        }
-      }
-      // Если ошибка другая, прокидываем дальше
-      throw err;
-    }
-  }
-  throw new Error(`Не удалось выполнить действие "${actionName}" после нескольких попыток смены ключа.`);
-}
-// ---------------------------------------------
-
-
 // ---------- /start ----------
 const mainMenuKeyboard = new Keyboard()
   .text("🎬 Создать сериал")
@@ -181,7 +118,6 @@ bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я создаю короткие AI-сериалы по твоему сюжету, а ещё умею делать короткие TikTok-style видео.\n\n" +
     "Выбери внизу, что хочешь сделать — 🎬 сериал или 🎥 TikTok.\n\n" +
-    "Команда `/update_key` — пополнение базы API ключей WaveSpeed.\n" +
     "Если генерация упадёт с ошибкой — команда /replay продолжит с того места, где остановилось.",
     { parse_mode: "Markdown", reply_markup: mainMenuKeyboard }
   );
@@ -308,28 +244,6 @@ async function processCustomVisualBatch(userId) {
 
 bot.command("new_episode", startNewEpisode);
 
-
-// ---------- ОБНОВЛЕНИЕ КЛЮЧЕЙ (БАЗА ДАННЫХ) ----------
-bot.command("update_key", async (ctx) => {
-  ctx.session.step = "awaiting_api_keys";
-  await ctx.reply(
-    "🔑 Скинь API ключи WaveSpeed (можно сразу списком, каждый с новой строки).\n\n" +
-    "🔗 Ссылка на сайт: https://wavespeed.io/login\n\n" +
-    "Когда скинешь все ключи, нажми /finish_key чтобы завершить прием."
-  );
-});
-
-bot.command("finish_key", async (ctx) => {
-  if (ctx.session.step === "awaiting_api_keys") {
-    ctx.session.step = null;
-    await ctx.reply("✅ Прием ключей окончен. Теперь бот будет автоматически брать их из базы.");
-  } else {
-    await ctx.reply("Прием ключей сейчас и так не идет. Начни с команды /update_key.");
-  }
-});
-// ---------------------------------------------------
-
-
 // ---------- /replay ----------
 bot.command("replay", async (ctx) => {
   const telegramId = ctx.from.id;
@@ -340,11 +254,6 @@ bot.command("replay", async (ctx) => {
     return;
   }
 
-  // Раньше здесь short проверялся ПЕРВЫМ и безусловно — если у тебя когда-то
-  // завис старый TikTok, /replay возвращался к нему навсегда, даже если ты
-  // сейчас работаешь над сериалом и именно он прервался последним. Теперь
-  // берём оба кандидата и сравниваем по created_at — резюмируем то, что
-  // реально начиналось позже.
   const { data: short, error: shortError } = await supabase
     .from("shorts")
     .select("*")
@@ -406,11 +315,6 @@ bot.command("cancel", async (ctx) => {
     return;
   }
 
-  // Кладём resource_id в cancelledResources ДО освобождения лока — циклы
-  // генерации (processEpisode, pollScenes, сборка short'а) проверяют это
-  // множество между шагами и сами остановятся на ближайшей проверке. Уже
-  // отправленный в WaveSpeed единичный запрос долетит и потратится (это
-  // деньги, которые не вернуть), но дальше по цепочке бот не пойдёт.
   cancelledResources.add(activeLock.resource_id);
 
   if (activeLock.kind === "episode") {
@@ -420,7 +324,7 @@ bot.command("cancel", async (ctx) => {
   }
 
   await releaseGenerationLock(telegramId);
-  await ctx.reply("🛑 Останавливаю текущую генерацию. Уже запущенный к WaveSpeed запрос может доработать в фоне, но бот дальше по нему ничего делать не будет. Начать заново — /new_short или /new_episode.");
+  await ctx.reply("🛑 Останавливаю текущую генерацию. Уже запущенный запрос может доработать в фоне, но бот дальше по нему ничего делать не будет. Начать заново — /new_short или /new_episode.");
 });
 
 async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, customVisuals = null) {
@@ -483,8 +387,6 @@ async function resumeShortFromReplay(ctx, short) {
 
 let currentlyBuildingShortId = null;
 let currentGeneration = null;
-// Резервируем ID отменённых episode/short — циклы генерации проверяют это
-// множество между шагами и останавливаются, если /cancel был вызван.
 const cancelledResources = new Set();
 
 const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000; 
@@ -788,18 +690,6 @@ bot.on("message:text", async (ctx, next) => {
 
   const step = ctx.session.step;
 
-  // НОВЫЙ БЛОК ПРИЕМА КЛЮЧЕЙ WAVESPEED
-  if (step === "awaiting_api_keys") {
-    const keys = ctx.message.text.split("\n").map(k => k.trim()).filter(Boolean);
-    let added = 0;
-    for (const key of keys) {
-      const { error } = await supabase.from("wavespeed_keys").insert({ key, is_active: true });
-      if (!error) added++;
-    }
-    await ctx.reply(`✅ Сохранил ключей: ${added}. Можешь кидать еще или жми /finish_key для завершения.`);
-    return;
-  }
-
   if (step === "awaiting_draft_text" || step === "awaiting_theme") {
     const isDraft = step === "awaiting_draft_text";
     await ctx.reply("Дорабатываю сценарий...");
@@ -971,13 +861,12 @@ bot.callbackQuery("chars_ai", async (ctx) => {
   await safeAnswer(ctx);
   await ctx.reply("Генерирую всех персонажей по описанию из сценария...");
   try {
-    // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-    const characters = await withKeyRotation(ctx, "генерация персонажей", () => generateCharacterImages(ctx.session.draft.script.characters));
+    const characters = await generateCharacterImages(ctx.session.draft.script.characters);
     ctx.session.draft.characters = characters;
     await confirmAndEstimateCredits(ctx);
   } catch (err) {
     console.error("Ошибка генерации персонажей:", err);
-    await ctx.reply("WaveSpeed не ответил (или закончились ключи).", { parse_mode: "Markdown" });
+    await ctx.reply("Парсер не ответил (или возникла ошибка).", { parse_mode: "Markdown" });
   }
 });
 
@@ -1053,8 +942,7 @@ bot.command("done", async (ctx) => {
   if (missing.length > 0) {
     await ctx.reply(`Генерирую недостающих персонажей (${missing.map((c) => c.name).join(", ")})...`);
     try {
-      // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-      const generated = await withKeyRotation(ctx, "недостающие персонажи", () => generateCharacterImages(missing));
+      const generated = await generateCharacterImages(missing);
       ctx.session.draft.characters.push(...generated);
     } catch (err) {
       await ctx.reply("Ошибка генерации. Пришли фото для оставшихся вручную.");
@@ -1078,23 +966,11 @@ async function confirmAndEstimateCredits(ctx) {
       characterCount: ctx.session.draft.characters.length,
     });
 
-    let balance = null;
-    try { 
-      balance = await withKeyRotation(ctx, "проверка баланса", checkBalance); 
-    } catch (err) {}
-
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
-    let balanceLine = "";
-    if (balance !== null) {
-      balanceLine = `\nБаланс WaveSpeed: $${balance.toFixed(2)}.`;
-      if (balance < estimatedCost) balanceLine += `\n⚠️ Баланса может не хватить на весь эпизод, но бот сам переключит ключ, если они есть в базе.`;
-    }
-
     await ctx.reply(
-      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n` +
-      `Примерно $${estimatedCost.toFixed(2)} на WaveSpeed.${balanceLine}\n\nПодтверждаешь генерацию?`,
+      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n\nПодтверждаешь генерацию?`,
       { reply_markup: kb, parse_mode: "Markdown" }
     );
   } catch (err) {
@@ -1154,8 +1030,7 @@ async function processEpisode(ctx, episode) {
     await ctx.reply(`Готовлю фон для локаций (${missingLocations.map((l) => l.name).join(", ")})...`);
     for (const loc of missingLocations) {
       try {
-        // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-        loc.image_url = await withKeyRotation(ctx, `фон локации "${loc.name}"`, () => generateLocationImage(loc.description));
+        loc.image_url = await generateLocationImage(loc.description);
       } catch (err) {
         console.error(`Не удалось сгенерировать фон локации "${loc.name}":`, err.message);
         await ctx.reply(`⚠️ Не получилось сгенерировать фон для локации "${loc.name}": ${err.message}`);
@@ -1198,13 +1073,12 @@ async function processEpisode(ctx, episode) {
             throw new Error(`Фон локации "${scene.location}" не готов (не сгенерировался ранее) — пропускаю референс для этой сцены.`);
           }
 
-          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-          referenceImageUrl = await withKeyRotation(ctx, `референс сцены ${sceneNumber}`, () => generateSceneReferenceImage(
+          referenceImageUrl = await generateSceneReferenceImage(
             locationImageUrl,
             charRefs,
             scene.character_position || "in the scene",
             scene.shot_type || "medium close-up"
-          ));
+          );
         } catch (err) {
           console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
         }
@@ -1235,12 +1109,11 @@ async function processEpisode(ctx, episode) {
         }
 
         try {
-          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-          const videoResult = await withKeyRotation(ctx, `видео для сцены ${sceneNumber}`, () => generateVideoScene({
+          const videoResult = await generateVideoScene({
             referenceImageUrl: record.character_ref_image_url,
             prompt: scene.script_text,
             shotType: scene.shot_type || "medium close-up",
-          }));
+          });
           const taskId = videoResult.job_id;
           await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", record.id);
           record.video_job_id = taskId;
@@ -1255,18 +1128,10 @@ async function processEpisode(ctx, episode) {
 
       if (scene.voiceover_text && !record.voiceover_audio_url) {
         try {
-          // РАНЬШЕ голос всегда брался по primary_character сцены — а это тот,
-          // кто "в фокусе кадра", не обязательно тот, кто говорит реплику.
-          // Если крупным планом лицо слушающего, а озвучка — реплика собеседника
-          // за кадром, голос подбирался под неправильного персонажа (отсюда и
-          // "мужику женский голос"). Теперь берём явное поле scene.speaker из
-          // сценария; на старых эпизодах (сгенерированных до этого фикса, где
-          // speaker ещё нет) откатываемся на primary_character как раньше.
           const speakerName = scene.speaker || sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
           
-          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-          const audioUrl = await withKeyRotation(ctx, `озвучка сцены ${sceneNumber}`, () => generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || ""));
+          const audioUrl = await generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || "");
 
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
@@ -1284,13 +1149,10 @@ async function processEpisode(ctx, episode) {
   } catch (error) {
     console.error("Критическая ошибка в processEpisode:", error);
     await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply("Генерация прервалась из-за ошибки (возможно закончились ключи). Возобнови её с помощью /replay.");
+    await ctx.reply("Генерация прервалась из-за ошибки. Возобнови её с помощью /replay.");
   }
 }
 
-// Если сцена висит в processing дольше этого — считаем джобу утерянной
-// (например, контейнер перезапускался, пока WaveSpeed её выполнял, и мы
-// потеряли связь с job_id) и не держим весь эпизод в заложниках вечно.
 const SCENE_STUCK_TIMEOUT_MS = 15 * 60 * 1000;
 
 async function pollScenes(ctx, episodeId) {
@@ -1311,11 +1173,6 @@ async function pollScenes(ctx, episodeId) {
 
     const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
 
-    // Сцены, которые висят в processing дольше SCENE_STUCK_TIMEOUT_MS, считаем
-    // зависшими. Раньше сразу списывали в failed — по просьбе даём ещё один
-    // шанс: перезапускаем генерацию видео с тем же референсом (retry_count
-    // отслеживает, что доп. попытка уже была использована, чтобы не ретраить
-    // одну и ту же сцену бесконечно). Если и повтор завис — тогда уже failed.
     for (const s of scenes) {
       if (s.video_status !== "processing") continue;
       const attemptStart = new Date(s.last_attempt_at || s.created_at).getTime();
@@ -1324,11 +1181,11 @@ async function pollScenes(ctx, episodeId) {
       if (s.retry_count < 1 && s.character_ref_image_url) {
         try {
           await ctx.reply(`🔁 Сцена ${s.scene_number} зависла — пробую сгенерировать её ещё раз.`).catch(() => {});
-          const retryResult = await withKeyRotation(ctx, `повтор видео для сцены ${s.scene_number}`, () => generateVideoScene({
+          const retryResult = await generateVideoScene({
             referenceImageUrl: s.character_ref_image_url,
             prompt: s.script_text,
             shotType: s.shot_type || "medium close-up",
-          }));
+          });
           await supabase.from("scenes").update({
             video_job_id: retryResult.job_id,
             video_status: "processing",
@@ -1338,10 +1195,9 @@ async function pollScenes(ctx, episodeId) {
           s.video_job_id = retryResult.job_id;
           s.last_attempt_at = new Date().toISOString();
           s.retry_count += 1;
-          continue; // даём этой попытке свои полные 15 минут, сцена остаётся "processing"
+          continue; 
         } catch (err) {
           console.error(`Не удалось перезапустить сцену ${s.scene_number} после зависания:`, err.message);
-          // падаем в failed ниже
         }
       }
 
@@ -1352,10 +1208,6 @@ async function pollScenes(ctx, episodeId) {
 
     const pending = scenes.filter((s) => s.video_status === "processing" || s.video_status === "pending");
 
-    // Раньше в это время (пока идёт wan-2.2/i2v-720p — он заметно медленнее
-    // ultra-fast) бот молчал полностью, и со стороны это выглядело как
-    // "сломалось". Раз в ~2 минуты (каждые 4 цикла по 30с) шлём короткий
-    // heartbeat, чтобы было видно, что процесс жив и просто ждёт WaveSpeed.
     if (pending.length > 0 && cycle % 4 === 0) {
       const minutesElapsed = Math.round((Date.now() - startedAt) / 60000);
       await ctx.reply(`⏳ Ещё генерирую: осталось сцен — ${pending.length}. Прошло ~${minutesElapsed} мин.`).catch(() => {});
@@ -1406,8 +1258,7 @@ async function pollScenes(ctx, episodeId) {
       for (const scene of pending) {
         if (!scene.video_job_id) continue;
         try {
-          // ВЫЗОВ С РОТАЦИЕЙ КЛЮЧЕЙ
-          const status = await withKeyRotation(ctx, `проверка статуса сцены ${scene.scene_number}`, () => checkVideoStatus(scene.video_job_id));
+          const status = await checkVideoStatus(scene.video_job_id);
           
           if (status.done) {
             await supabase.from("scenes").update({ video_status: "completed", video_url: status.video_url }).eq("id", scene.id);
@@ -1450,15 +1301,6 @@ app.listen(PORT, async () => {
   if (publicUrl) {
     await bot.api.setWebhook(publicUrl);
     console.log("Webhook set to", publicUrl);
-
-    // ВАЖНО: Render free tier "усыпляет" контейнер, если 15 минут не было
-    // ВХОДЯЩИХ HTTP-запросов — независимо от того, чем занят процесс внутри.
-    // Сборка сериала (несколько сцен на i2v-720p + опрос статуса каждые 30с)
-    // легко занимает больше 15 минут, и если пользователь в это время не
-    // пишет боту, Render убивает контейнер прямо посреди генерации — именно
-    // поэтому видео "зависает" и не собирается, а /replay потом находит
-    // прерванный эпизод заново. Само-пинг каждые 10 минут держит инстанс
-    // живым столько, сколько нужно на генерацию, не дожидаясь сообщений юзера.
     setInterval(() => {
       fetch(publicUrl).catch((err) => console.warn("Self-ping не удался:", err.message));
     }, 10 * 60 * 1000);
