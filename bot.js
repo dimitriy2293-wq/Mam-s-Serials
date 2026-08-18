@@ -6,15 +6,10 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
-import {
-  generateCharacterImages,
-  generateSceneReferenceImage,
-  generateLocationImage,
-  generateVideoScene,
-  checkVideoStatus,
-  estimateEpisodeCostUsd,
-  estimateMaxScenes,
-} from "./lib/wavespeed.js";
+
+// ПОДТЯГИВАЕМ ТВОИ НОВЫЕ ФАЙЛЫ ДЛЯ ВИДЕО И ВРЕМЕННОЙ ПОЧТЫ
+import { DigenAPI } from "./lib/digen.js";
+
 // ПОДКЛЮЧАЕМ ELEVENLABS ДЛЯ ОЗВУЧКИ СЕРИАЛОВ
 import { generateVoiceover } from "./lib/elevenlabs.js"; 
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
@@ -29,6 +24,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
+
+// --- ИНТЕГРАЦИЯ POLLINATIONS.AI ДЛЯ БЕСПЛАТНЫХ КАРТИНОК ---
+const estimateEpisodeCostUsd = () => 0; // Теперь всё бесплатно
+const estimateMaxScenes = () => 15; // Лимит сцен
+
+async function generateLocationImage(prompt) {
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt + " cinematic background environment high quality")}`;
+}
+
+async function generateCharacterImages(characters) {
+  return characters.map(c => ({
+    name: c.name,
+    source: "ai",
+    ref_image_url: `https://image.pollinations.ai/prompt/${encodeURIComponent(c.name + " " + (c.description || "") + " character portrait detailed")}`
+  }));
+}
+
+async function generateSceneReferenceImage(locationUrl, charRefs, position, shotType) {
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(position + " " + shotType + " cinematic shot")}`;
+}
+// ---------------------------------------------------------
 
 async function safeAnswer(ctx) {
   await ctx.answerCallbackQuery().catch((err) => {
@@ -695,7 +711,7 @@ bot.on("message:text", async (ctx, next) => {
     const isDraft = step === "awaiting_draft_text";
     await ctx.reply("Дорабатываю сценарий...");
 
-    const maxScenes = estimateMaxScenes(1, { locationCount: 1, characterCount: 2 });
+    const maxScenes = estimateMaxScenes();
 
     let script;
     try {
@@ -860,7 +876,7 @@ bot.callbackQuery("chars_own", async (ctx) => {
 
 bot.callbackQuery("chars_ai", async (ctx) => {
   await safeAnswer(ctx);
-  await ctx.reply("Генерирую всех персонажей по описанию из сценария...");
+  await ctx.reply("Генерирую всех персонажей по описанию из сценария через Pollinations...");
   try {
     const characters = await generateCharacterImages(ctx.session.draft.script.characters);
     ctx.session.draft.characters = characters;
@@ -941,7 +957,7 @@ bot.command("done", async (ctx) => {
   const missing = scriptCharacters.filter((c) => !haveNames.includes(c.name));
 
   if (missing.length > 0) {
-    await ctx.reply(`Генерирую недостающих персонажей (${missing.map((c) => c.name).join(", ")})...`);
+    await ctx.reply(`Дособираю недостающих персонажей через ИИ (${missing.map((c) => c.name).join(", ")})...`);
     try {
       const generated = await generateCharacterImages(missing);
       ctx.session.draft.characters.push(...generated);
@@ -957,21 +973,12 @@ async function confirmAndEstimateCredits(ctx) {
   try {
     const scenes = ctx.session.draft.script.scenes;
     const totalSeconds = scenes.reduce((s, sc) => s + sc.duration_sec, 0);
-    const locationsNeedingGen = (ctx.session.draft.locations || []).filter((l) => !l.image_url).length;
-    const voiceoverSceneCount = scenes.filter((s) => s.voiceover_text).length;
-
-    const estimatedCost = estimateEpisodeCostUsd({
-      sceneCount: scenes.length,
-      locationCount: locationsNeedingGen,
-      voiceoverSceneCount,
-      characterCount: ctx.session.draft.characters.length,
-    });
 
     ctx.session.step = "awaiting_generation_confirm";
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
     await ctx.reply(
-      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n\nПодтверждаешь генерацию?`,
+      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n\n💰 Стоимость: **БЕСПЛАТНО** (Digen AI + Pollinations.ai)\n\nПодтверждаешь генерацию?`,
       { reply_markup: kb, parse_mode: "Markdown" }
     );
   } catch (err) {
@@ -989,7 +996,7 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Начинаю генерацию. Это займет несколько минут...");
+  await ctx.reply("🎬 Начинаю генерацию. Это займет несколько минут...");
 
   const { data: episode } = await supabase
     .from("episodes")
@@ -1028,7 +1035,7 @@ async function processEpisode(ctx, episode) {
 
   const missingLocations = locations.filter((l) => !l.image_url);
   if (missingLocations.length > 0) {
-    await ctx.reply(`Готовлю фон для локаций (${missingLocations.map((l) => l.name).join(", ")})...`);
+    await ctx.reply(`Готовлю фон для локаций через Pollinations (${missingLocations.map((l) => l.name).join(", ")})...`);
     for (const loc of missingLocations) {
       try {
         loc.image_url = await generateLocationImage(loc.description);
@@ -1039,7 +1046,20 @@ async function processEpisode(ctx, episode) {
     }
     await supabase.from("episodes").update({ locations }).eq("id", episode.id);
   }
-  const locationByName = new Map(locations.map((l) => [l.name, l]));
+
+  // --- ИНИЦИАЛИЗАЦИЯ DIGEN API С ВРЕМЕННОЙ ПОЧТОЙ ---
+  const digen = new DigenAPI();
+  let digenReady = false;
+  try {
+    await ctx.reply("🔑 Создаю временную почту и авторизуюсь в Digen (занимает около минуты)...");
+    await digen.registerAndAuth();
+    digenReady = true;
+    await ctx.reply("✅ Успешно вошли в Digen, начинаю генерировать сцены.");
+  } catch (err) {
+    console.error("Ошибка авторизации Digen:", err);
+    await ctx.reply("⚠️ Не удалось авторизоваться в Digen: " + err.message + "\nДальнейшая генерация видео невозможна.");
+  }
+  // --------------------------------------------------
 
   const { data: existingScenes } = await supabase.from("scenes").select("*").eq("episode_id", episode.id);
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
@@ -1061,28 +1081,10 @@ async function processEpisode(ctx, episode) {
 
       let record = existingByNumber.get(sceneNumber);
       if (!record) {
-        const charRefs = sceneCharacterNames(scene)
-          .map((n) => characters.find((c) => c.name === n)?.ref_image_url)
-          .filter(Boolean);
-
-        let referenceImageUrl = null;
-        try {
-          const loc = locationByName.get(scene.location);
-          const locationImageUrl = loc ? loc.image_url : null;
-
-          if (!locationImageUrl) {
-            throw new Error(`Фон локации "${scene.location}" не готов (не сгенерировался ранее) — пропускаю референс для этой сцены.`);
-          }
-
-          referenceImageUrl = await generateSceneReferenceImage(
-            locationImageUrl,
-            charRefs,
-            scene.character_position || "in the scene",
-            scene.shot_type || "medium close-up"
-          );
-        } catch (err) {
-          console.error(`Ошибка генерации референса для сцены ${sceneNumber}:`, err.message);
-        }
+        // Просто генерируем референс через Pollinations для БД
+        const referenceImageUrl = await generateSceneReferenceImage(
+            null, [], scene.character_position || "in the scene", scene.shot_type || "medium close-up"
+        );
 
         const { data: newScene, error: insertSceneError } = await supabase
           .from("scenes")
@@ -1090,7 +1092,7 @@ async function processEpisode(ctx, episode) {
             episode_id: episode.id,
             scene_number: sceneNumber,
             script_text: scene.script_text,
-            video_status: "pending",
+            video_status: digenReady ? "pending" : "failed",
             character_ref_image_url: referenceImageUrl,
             duration_sec: scene.duration_sec || 5,
             shot_type: scene.shot_type || "medium close-up",
@@ -1102,28 +1104,19 @@ async function processEpisode(ctx, episode) {
         }
         record = newScene;
 
-        if (!record.character_ref_image_url) {
-          console.error(`Сцена ${sceneNumber}: нет референс-картинки, пропускаю генерацию видео.`);
-          await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
-          record.video_status = "failed";
-          continue;
-        }
-
-        try {
-          const videoResult = await generateVideoScene({
-            referenceImageUrl: record.character_ref_image_url,
-            prompt: scene.script_text,
-            shotType: scene.shot_type || "medium close-up",
-          });
-          const taskId = videoResult.job_id;
-          await supabase.from("scenes").update({ video_job_id: taskId, video_status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", record.id);
-          record.video_job_id = taskId;
-          record.video_status = "processing";
-        } catch (err) {
-          console.error(`Ошибка запуска генерации видео для сцены ${sceneNumber}:`, err.message);
-          await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
-          record.video_status = "failed";
-          continue;
+        if (digenReady) {
+          // --- ЗАПУСКАЕМ DIGEN В ФОНЕ (Асинхронно, чтобы не блочить луп) ---
+          (async () => {
+             try {
+                 await supabase.from("scenes").update({ video_status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", record.id);
+                 const videoUrl = await digen.generateVideo(scene.script_text);
+                 await supabase.from("scenes").update({ video_status: "completed", video_url: videoUrl }).eq("id", record.id);
+             } catch (err) {
+                 console.error(`Ошибка генерации Digen для сцены ${sceneNumber}:`, err.message);
+                 await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
+             }
+          })();
+          // -----------------------------------------------------------------
         }
       }
 
@@ -1132,7 +1125,6 @@ async function processEpisode(ctx, episode) {
           const speakerName = scene.speaker || sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
           
-          // ЗАМЕНА ЗДЕСЬ: используем ElevenLabs для озвучки сцены вместо WaveSpeed
           const audioUrl = await generateVoiceover(scene.voiceover_text, speakerDescription || speakerName || "");
 
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
@@ -1146,6 +1138,8 @@ async function processEpisode(ctx, episode) {
         }
       }
     }
+    
+    // Ждем пока все фоновые Digen задачи в базе перейдут в completed/failed
     await pollScenes(ctx, episode.id);
 
   } catch (error) {
@@ -1155,8 +1149,7 @@ async function processEpisode(ctx, episode) {
   }
 }
 
-const SCENE_STUCK_TIMEOUT_MS = 15 * 60 * 1000;
-
+// Новый pollScenes, который тупо ждет обновления статусов из асинхронных задач Digen
 async function pollScenes(ctx, episodeId) {
   let isDone = false;
   let compositeWarned = false;
@@ -1164,7 +1157,7 @@ async function pollScenes(ctx, episodeId) {
   const startedAt = Date.now();
 
   while (!isDone) {
-    await new Promise((res) => setTimeout(res, 30_000));
+    await new Promise((res) => setTimeout(res, 15_000));
     cycle++;
 
     if (cancelledResources.has(episodeId)) {
@@ -1174,45 +1167,12 @@ async function pollScenes(ctx, episodeId) {
     }
 
     const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
-
-    for (const s of scenes) {
-      if (s.video_status !== "processing") continue;
-      const attemptStart = new Date(s.last_attempt_at || s.created_at).getTime();
-      if (Date.now() - attemptStart <= SCENE_STUCK_TIMEOUT_MS) continue;
-
-      if (s.retry_count < 1 && s.character_ref_image_url) {
-        try {
-          await ctx.reply(`🔁 Сцена ${s.scene_number} зависла — пробую сгенерировать её ещё раз.`).catch(() => {});
-          const retryResult = await generateVideoScene({
-            referenceImageUrl: s.character_ref_image_url,
-            prompt: s.script_text,
-            shotType: s.shot_type || "medium close-up",
-          });
-          await supabase.from("scenes").update({
-            video_job_id: retryResult.job_id,
-            video_status: "processing",
-            retry_count: s.retry_count + 1,
-            last_attempt_at: new Date().toISOString(),
-          }).eq("id", s.id);
-          s.video_job_id = retryResult.job_id;
-          s.last_attempt_at = new Date().toISOString();
-          s.retry_count += 1;
-          continue; 
-        } catch (err) {
-          console.error(`Не удалось перезапустить сцену ${s.scene_number} после зависания:`, err.message);
-        }
-      }
-
-      await supabase.from("scenes").update({ video_status: "failed" }).eq("id", s.id);
-      s.video_status = "failed";
-      await ctx.reply(`⌛ Сцена ${s.scene_number} не ответила даже после повтора — пропускаю её, собираю эпизод без неё.`).catch(() => {});
-    }
-
+    
     const pending = scenes.filter((s) => s.video_status === "processing" || s.video_status === "pending");
 
     if (pending.length > 0 && cycle % 4 === 0) {
       const minutesElapsed = Math.round((Date.now() - startedAt) / 60000);
-      await ctx.reply(`⏳ Ещё генерирую: осталось сцен — ${pending.length}. Прошло ~${minutesElapsed} мин.`).catch(() => {});
+      await ctx.reply(`⏳ Digen генерирует видео... осталось сцен: ${pending.length}. Прошло ~${minutesElapsed} мин.`).catch(() => {});
     }
 
     if (pending.length === 0) {
@@ -1220,7 +1180,7 @@ async function pollScenes(ctx, episodeId) {
       const allSuccess = scenes.every((s) => s.video_status === "completed" && s.video_url);
 
       if (!allSuccess && !compositeWarned) {
-         await ctx.reply("Некоторые сцены не удалось сгенерировать. Собираю эпизод из того, что получилось.");
+         await ctx.reply("Некоторые сцены Digen не смог сгенерировать. Собираю эпизод из того, что получилось.");
          compositeWarned = true;
       }
 
@@ -1228,23 +1188,23 @@ async function pollScenes(ctx, episodeId) {
 
       if (validScenes.length === 0) {
          await supabase.from("episodes").update({ status: "error" }).eq("id", episodeId);
-         await ctx.reply("Не удалось сгенерировать ни одной сцены.");
+         await ctx.reply("Digen не выдал ни одной рабочей сцены.");
          return;
       }
 
-      await ctx.reply("Видео сгенерировано! Начинаю сборку со звуком...");
+      await ctx.reply("Все видео готовы! Начинаю склейку и удаление водяного знака...");
       try {
         const { localPath: finalPath, publicUrl } = await assembleEpisode(validScenes, episodeId);
         await supabase.from("episodes").update({ status: "completed", final_video_url: publicUrl }).eq("id", episodeId);
 
         try {
           await ctx.replyWithVideo(publicUrl, {
-            caption: "✅ Готово! Твой сериал.\n\nНачать новый — /new_episode.",
+            caption: "✅ Готово! Твой сериал от Digen.\n\nНачать новый — /new_episode.",
           });
         } catch (sendErr) {
           console.warn("Отправка эпизода по ссылке не удалась, пробую загрузить файл напрямую:", sendErr.message);
           await ctx.replyWithVideo(new InputFile(finalPath), {
-            caption: "✅ Готово! Твой сериал.\n\nНачать новый — /new_episode.",
+            caption: "✅ Готово! Твой сериал от Digen.\n\nНачать новый — /new_episode.",
           });
         }
 
@@ -1255,23 +1215,6 @@ async function pollScenes(ctx, episodeId) {
         console.error("Ошибка сборки:", err);
         await supabase.from("episodes").update({ status: "error", error: err.message }).eq("id", episodeId);
         await ctx.reply("Видео готовы, но не получилось собрать (FFmpeg). Попробуй /replay позже.");
-      }
-    } else {
-      for (const scene of pending) {
-        if (!scene.video_job_id) continue;
-        try {
-          const status = await checkVideoStatus(scene.video_job_id);
-          
-          if (status.done) {
-            await supabase.from("scenes").update({ video_status: "completed", video_url: status.video_url }).eq("id", scene.id);
-            await ctx.reply(`✅ Сцена ${scene.scene_number} готова!`);
-          } else if (status.error) {
-            await supabase.from("scenes").update({ video_status: "failed" }).eq("id", scene.id);
-            await ctx.reply(`❌ Ошибка генерации сцены ${scene.scene_number}.`);
-          }
-        } catch (err) {
-          console.error(`Ошибка проверки сцены ${scene.id}:`, err);
-        }
       }
     }
   }
