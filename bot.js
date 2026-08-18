@@ -14,8 +14,8 @@ import {
   checkBalance,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
-} from "./lib/wavespeed.js"; // Убрали генерацию видео отсюда
-import { generateVideoSceneDigen, checkVideoStatusDigen } from "./lib/digen.js"; // Подключили Digen
+} from "./lib/wavespeed.js"; 
+import { generateVideoSceneDigen, checkVideoStatusDigen } from "./lib/digen.js"; 
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket, uploadToStorage } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
@@ -198,7 +198,6 @@ async function startNewShort(ctx) {
 bot.hears("🎬 Создать сериал", startNewEpisode);
 bot.hears("🎥 Создать TikTok", startNewShort);
 
-
 // ---------- Выбор визуала: свои файлы или автоподбор ----------
 bot.callbackQuery("visuals_auto", async (ctx) => {
   await safeAnswer(ctx);
@@ -314,7 +313,6 @@ bot.command("finish_key", async (ctx) => {
     await ctx.reply("Прием ключей сейчас и так не идет. Начни с команды /update_key.");
   }
 });
-
 
 // ---------- /replay ----------
 bot.command("replay", async (ctx) => {
@@ -889,6 +887,7 @@ async function runShortPipeline(ctx, rawInput) {
     `⏳ После получения файла я сам соберу: визуал + твою озвучку + музыку + субтитры и пришлю готовый TikTok.`
   );
 }
+
 async function askLocationStep(ctx) {
   const { locations, locationQueueIndex } = ctx.session.draft;
   if (locationQueueIndex >= locations.length) {
@@ -1203,7 +1202,7 @@ async function processEpisode(ctx, episode) {
         }
 
         try {
-          // ИСПОЛЬЗУЕМ DIGEN ДЛЯ ВИДЕО (без ротатора WaveSpeed, Digen обновится сам)
+          // ИСПОЛЬЗУЕМ DIGEN ДЛЯ ВИДЕО
           const videoResult = await generateVideoSceneDigen({
             referenceImageUrl: record.character_ref_image_url,
             prompt: scene.script_text,
@@ -1277,7 +1276,6 @@ async function pollScenes(ctx, episodeId) {
         try {
           await ctx.reply(`🔁 Сцена ${s.scene_number} зависла — пробую сгенерировать её ещё раз.`).catch(() => {});
           
-          // Повторяем генерацию через Digen
           const retryResult = await generateVideoSceneDigen({
             referenceImageUrl: s.character_ref_image_url,
             prompt: s.script_text,
