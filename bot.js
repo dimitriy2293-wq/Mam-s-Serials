@@ -11,11 +11,12 @@ import {
   generateSceneReferenceImage,
   generateLocationImage,
   generateVideoScene,
-  generateVoiceoverWaveSpeed,
   checkVideoStatus,
   estimateEpisodeCostUsd,
   estimateMaxScenes,
 } from "./lib/wavespeed.js";
+// ПОДКЛЮЧАЕМ ELEVENLABS ДЛЯ ОЗВУЧКИ СЕРИАЛОВ
+import { generateVoiceover } from "./lib/elevenlabs.js"; 
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket, uploadToStorage } from "./lib/storage.js";
 import { supabaseSessionStorage } from "./lib/session-storage.js";
@@ -1131,7 +1132,8 @@ async function processEpisode(ctx, episode) {
           const speakerName = scene.speaker || sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
           
-          const audioUrl = await generateVoiceoverWaveSpeed(scene.voiceover_text, speakerDescription || "");
+          // ЗАМЕНА ЗДЕСЬ: используем ElevenLabs для озвучки сцены вместо WaveSpeed
+          const audioUrl = await generateVoiceover(scene.voiceover_text, speakerDescription || speakerName || "");
 
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
