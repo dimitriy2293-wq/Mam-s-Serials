@@ -1,3 +1,4 @@
+// bot.js
 import { Bot, session, InlineKeyboard, Keyboard, InputFile, webhookCallback } from "grammy";
 import express from "express";
 import "dotenv/config";
@@ -7,10 +8,7 @@ import { fileURLToPath } from "url";
 import { supabase } from "./lib/supabase.js";
 import { generateScript } from "./lib/gemini.js";
 
-// ПОДТЯГИВАЕМ ТВОИ НОВЫЕ ФАЙЛЫ ДЛЯ ВИДЕО И ВРЕМЕННОЙ ПОЧТЫ
 import { DigenAPI } from "./lib/digen.js";
-
-// ПОДКЛЮЧАЕМ ELEVENLABS ДЛЯ ОЗВУЧКИ СЕРИАЛОВ
 import { generateVoiceover } from "./lib/elevenlabs.js"; 
 import { assembleEpisode } from "./lib/ffmpeg-assemble.js";
 import { ensureBucket, uploadToStorage } from "./lib/storage.js";
@@ -19,15 +17,13 @@ import { isUrl, fetchArticle, generateShortScript } from "./lib/shorts-script.js
 import { analyzeStyleFromVideo, MAX_STYLE_VIDEO_BYTES } from "./lib/style-learning.js";
 import { assembleShort } from "./lib/shorts-assemble.js";
 
-// Настройка путей
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
-// --- ИНТЕГРАЦИЯ POLLINATIONS.AI ДЛЯ БЕСПЛАТНЫХ КАРТИНОК ---
-const estimateEpisodeCostUsd = () => 0; // Теперь всё бесплатно
-const estimateMaxScenes = () => 15; // Лимит сцен
+const estimateEpisodeCostUsd = () => 0; 
+const estimateMaxScenes = () => 15; 
 
 async function generateLocationImage(prompt) {
   return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt + " cinematic background environment high quality")}`;
@@ -44,7 +40,6 @@ async function generateCharacterImages(characters) {
 async function generateSceneReferenceImage(locationUrl, charRefs, position, shotType) {
   return `https://image.pollinations.ai/prompt/${encodeURIComponent(position + " " + shotType + " cinematic shot")}`;
 }
-// ---------------------------------------------------------
 
 async function safeAnswer(ctx) {
   await ctx.answerCallbackQuery().catch((err) => {
@@ -56,7 +51,6 @@ function normalizeName(name) {
   return (name || "").trim().toLowerCase();
 }
 
-// ---------- Дедупликация Telegram update ----------
 bot.use(async (ctx, next) => {
   const updateId = ctx.update?.update_id;
   if (updateId == null) return next();
@@ -68,13 +62,11 @@ bot.use(async (ctx, next) => {
       console.log(`Дубликат update_id=${updateId}, пропускаю повторную обработку.`);
       return;
     }
-    console.error("Дедупликация update не сработала (продолжаю без неё):", error.message);
+    console.error("Дедупликация update не сработала:", error.message);
   }
-
   return next();
 });
 
-// ---------- Build-lock для сборки Shorts ----------
 const BUILD_LOCK_STALE_MS = 15 * 60 * 1000; 
 
 async function acquireShortBuildLock(shortId) {
@@ -125,7 +117,6 @@ bot.use(session({
   getSessionKey: (ctx) => ctx.from?.id.toString(),
 }));
 
-// ---------- /start ----------
 const mainMenuKeyboard = new Keyboard()
   .text("🎬 Создать сериал")
   .text("🎥 Создать TikTok")
@@ -163,8 +154,6 @@ async function startNewShort(ctx) {
 bot.hears("🎬 Создать сериал", startNewEpisode);
 bot.hears("🎥 Создать TikTok", startNewShort);
 
-
-// ---------- Выбор визуала: свои файлы или автоподбор со стоков ----------
 bot.callbackQuery("visuals_auto", async (ctx) => {
   await safeAnswer(ctx);
   const { shortId, script, voiceoverUrl } = ctx.session.shortDraft || {};
@@ -261,7 +250,6 @@ async function processCustomVisualBatch(userId) {
 
 bot.command("new_episode", startNewEpisode);
 
-// ---------- /replay ----------
 bot.command("replay", async (ctx) => {
   const telegramId = ctx.from.id;
 
@@ -280,8 +268,6 @@ bot.command("replay", async (ctx) => {
     .limit(1)
     .maybeSingle();
 
-  if (shortError) console.error("Ошибка поиска short для /replay:", shortError);
-
   const { data: episode, error: episodeError } = await supabase
     .from("episodes")
     .select("*")
@@ -290,8 +276,6 @@ bot.command("replay", async (ctx) => {
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  if (episodeError) console.error("Ошибка поиска episode для /replay:", episodeError);
 
   if (!short && !episode) {
     await ctx.reply("Не получилось найти незавершённую задачу для повтора. Попробуй /new_short или /new_episode.");
@@ -322,7 +306,6 @@ bot.command("replay", async (ctx) => {
     .finally(() => releaseGenerationLock(telegramId));
 });
 
-// ---------- /cancel ----------
 bot.command("cancel", async (ctx) => {
   const telegramId = ctx.from.id;
   const activeLock = await getActiveGeneration(telegramId);
@@ -341,22 +324,21 @@ bot.command("cancel", async (ctx) => {
   }
 
   await releaseGenerationLock(telegramId);
-  await ctx.reply("🛑 Останавливаю текущую генерацию. Уже запущенный запрос может доработать в фоне, но бот дальше по нему ничего делать не будет. Начать заново — /new_short или /new_episode.");
+  await ctx.reply("🛑 Останавливаю текущую генерацию. Начать заново — /new_short или /new_episode.");
 });
 
 async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, customVisuals = null) {
   const gotLock = await acquireShortBuildLock(shortId);
   if (!gotLock) {
     await ctx.reply(
-      `⏳ TikTok «${title || "без названия"}» уже собирается. Дождись завершения — второй раз запускать не буду.\n\n` +
-      `Если сборка реально зависла дольше 15 минут, пришли /replay ещё раз — лок сбросится автоматически, и эта попытка запустит сборку заново.`
+      `⏳ TikTok «${title || "без названия"}» уже собирается. Дождись завершения.\n`
     );
     return;
   }
 
   const gotGenerationLock = await acquireGenerationLock(ctx.from.id, "short", shortId, title);
   if (!gotGenerationLock) {
-    await releaseShortBuildLock(shortId, { status: "error", error: "Другая генерация уже шла, начать сборку не удалось." });
+    await releaseShortBuildLock(shortId, { status: "error", error: "Другая генерация уже шла." });
     await ctx.reply(describeActiveGeneration(await getActiveGeneration(ctx.from.id)));
     return;
   }
@@ -367,7 +349,7 @@ async function startShortBuild(ctx, shortId, script, voiceoverUrl, title, custom
     visuals = data?.custom_visuals || [];
   }
 
-  await ctx.reply(`🎬 Начинаю монтаж «${title || "TikTok"}». Это может занять несколько минут...`);
+  await ctx.reply(`🎬 Начинаю монтаж «${title || "TikTok"}». Это займет несколько минут...`);
 
   assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, visuals)
     .catch(async (err) => {
@@ -384,8 +366,7 @@ async function resumeShortFromReplay(ctx, short) {
       ctx.session.shortDraft = { shortId: short.id, script: short.script };
       ctx.session.step = "awaiting_short_voice";
       await ctx.reply(
-        `🔄 Продолжаю TikTok «${short.title || "без названия"}».\n\n` +
-        `Озвучка ещё не получена. Пришли сюда готовый MP3, WAV, M4A, OGG или AAC — и я продолжу сборку с этого места.`
+        `🔄 Продолжаю TikTok «${short.title || "без названия"}».\n\nОзвучка ещё не получена. Пришли файл сюда.`
       );
       return;
     }
@@ -398,14 +379,13 @@ async function resumeShortFromReplay(ctx, short) {
   } catch (err) {
     console.error("Ошибка /replay для short:", err);
     await releaseShortBuildLock(short.id, { status: "error", error: err.message });
-    await ctx.reply(`❌ Не удалось продолжить TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`);
+    await ctx.reply(`❌ Не удалось продолжить TikTok.\n\n${err.message}`);
   }
 }
 
 let currentlyBuildingShortId = null;
 let currentGeneration = null;
 const cancelledResources = new Set();
-
 const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000; 
 
 async function acquireGenerationLock(telegramId, kind, resourceId, resourceTitle) {
@@ -418,7 +398,6 @@ async function acquireGenerationLock(telegramId, kind, resourceId, resourceTitle
 
   if (error) {
     if (error.code === "23505") return false; 
-    console.error("Ошибка при попытке взять generation lock:", error);
     return false;
   }
   currentGeneration = { telegramId, kind, resourceId };
@@ -426,8 +405,7 @@ async function acquireGenerationLock(telegramId, kind, resourceId, resourceTitle
 }
 
 async function releaseGenerationLock(telegramId) {
-  const { error } = await supabase.from("generation_locks").delete().eq("telegram_id", telegramId);
-  if (error) console.error("Не удалось освободить generation lock:", error);
+  await supabase.from("generation_locks").delete().eq("telegram_id", telegramId);
   currentGeneration = null;
 }
 
@@ -439,7 +417,7 @@ async function getActiveGeneration(telegramId) {
 function describeActiveGeneration(lock) {
   const kindLabel = lock.kind === "episode" ? "сериал" : "TikTok";
   const title = lock.resource_title ? ` «${lock.resource_title}»` : "";
-  return `⏳ Сейчас уже собирается ${kindLabel}${title}. Дождись, пока он закончится, прежде чем начинать новое.`;
+  return `⏳ Сейчас уже собирается ${kindLabel}${title}. Дождись окончания.`;
 }
 
 async function gracefulShutdown(signal) {
@@ -457,7 +435,7 @@ async function gracefulShutdown(signal) {
       try {
         await supabase
           .from("episodes")
-          .update({ status: "error", error: `Контейнер был перезапущен во время сборки (${signal}). Нажми /replay.` })
+          .update({ status: "error", error: `Контейнер был перезапущен (${signal}). Нажми /replay.` })
           .eq("id", currentGeneration.resourceId);
       } catch (err) {}
     }
@@ -483,7 +461,6 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, cust
       .from("shorts")
       .update({ status: "completed", final_video_url: publicUrl, error: null, build_lock: false })
       .eq("id", shortId);
-    if (error) console.error("Не удалось обновить completed short:", error);
 
     ctx.session.step = null;
     ctx.session.shortDraft = {};
@@ -493,15 +470,12 @@ async function assembleShortForTelegram(ctx, shortId, script, voiceoverUrl, cust
         caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
       });
     } catch (sendErr) {
-      console.warn("Отправка по ссылке не удалась, пробую загрузить файл напрямую:", sendErr.message);
       await ctx.replyWithVideo(new InputFile(finalPath), {
         caption: `✅ Готово! TikTok собран полностью.\n⏱ Длительность: ${totalDurationSec.toFixed(1)} сек.`,
       });
     }
 
-    try {
-      fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
-    } catch (cleanupError) {}
+    try { fs.rmSync(path.dirname(finalPath), { recursive: true, force: true }); } catch {}
   } finally {
     currentlyBuildingShortId = null;
   }
@@ -523,9 +497,8 @@ bot.command("new_short", startNewShort);
 
 bot.command("learn_style", async (ctx) => {
   await ctx.reply(
-    "Пришли сюда одно или несколько видео файлом (можно сразу пачкой/альбомом, не по одному) — " +
-    "разберу хук, темп, структуру, стиль субтитров и музыки в каждом, и учту это в следующих сценариях.\n\n" +
-    "⚠️ Telegram отдаёт боту файлы только до 20 MB за штуку — если видео тяжелее, сожми или обрежь покороче."
+    "Пришли сюда одно или несколько видео файлом (можно сразу пачкой) — " +
+    "разберу хук, темп, структуру, стиль субтитров и музыки в каждом, и учту это в следующих сценариях."
   );
 });
 
@@ -564,18 +537,14 @@ async function processVideoBatch(userId) {
   videoBatchBuffers.delete(userId);
 
   const { videos, ctx } = buffer;
-  await ctx.reply(
-    videos.length > 1
-      ? `📼 Получил ${videos.length} видео, разбираю стиль каждого (это может занять несколько минут)...`
-      : `📼 Видео получено, разбираю стиль (может занять минуту)...`
-  );
+  await ctx.reply(`📼 Получил ${videos.length} видео, разбираю стиль...`);
 
   let savedCount = 0;
   const failedReasons = [];
 
   for (const video of videos) {
     if (video.file_size && video.file_size > MAX_STYLE_VIDEO_BYTES) {
-      failedReasons.push(`${(video.file_size / 1024 / 1024).toFixed(1)} MB — больше 20 MB, Telegram не отдаст файл боту.`);
+      failedReasons.push(`${(video.file_size / 1024 / 1024).toFixed(1)} MB — больше 20 MB.`);
       continue;
     }
 
@@ -583,22 +552,18 @@ async function processVideoBatch(userId) {
     const localPath = path.join(workDir, "reference.mp4");
     try {
       const file = await ctx.api.getFile(video.file_id);
-      if (!file.file_path) throw new Error("Telegram не вернул путь к файлу видео.");
       const telegramFileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
       const response = await fetch(telegramFileUrl);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       fs.writeFileSync(localPath, Buffer.from(await response.arrayBuffer()));
 
       const styleProfile = await analyzeStyleFromVideo(localPath);
 
-      const { error: insertError } = await supabase
+      await supabase
         .from("short_styles")
         .insert({ telegram_id: userId, name: `видео от ${new Date().toLocaleDateString("ru-RU")}`, style_profile: styleProfile });
-      if (insertError) throw new Error(insertError.message);
 
       savedCount++;
     } catch (err) {
-      console.error("Ошибка анализа стиля видео:", err);
       failedReasons.push(err.message);
     } finally {
       try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
@@ -606,12 +571,7 @@ async function processVideoBatch(userId) {
   }
 
   let reply = `✅ Разобрано и сохранено: ${savedCount}/${videos.length}.`;
-  if (failedReasons.length > 0) {
-    reply += `\n\n❌ Не получилось разобрать:\n${failedReasons.map((r) => `— ${r}`).join("\n")}`;
-  }
-  if (savedCount > 0) {
-    reply += `\n\nТеперь новые сценарии в /new_short будут ориентироваться на стиль этих роликов.`;
-  }
+  if (failedReasons.length > 0) reply += `\n\n❌ Ошибки:\n${failedReasons.map((r) => `— ${r}`).join("\n")}`;
   await ctx.reply(reply);
 }
 
@@ -626,11 +586,7 @@ async function handleShortVoiceUpload(ctx) {
   const isDocument = Boolean(message.document);
   if (!isAudio && !isDocument) return false;
 
-  const fileName =
-    message.audio?.file_name ||
-    message.document?.file_name ||
-    `voiceover_${Date.now()}.mp3`;
-
+  const fileName = message.audio?.file_name || message.document?.file_name || `voiceover_${Date.now()}.mp3`;
   const extFromName = path.extname(fileName).toLowerCase();
   const mime = message.audio?.mime_type || message.document?.mime_type || "";
   const allowedExt = [".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus", ".aac"];
@@ -651,25 +607,18 @@ async function handleShortVoiceUpload(ctx) {
     await ctx.reply("🎙️ Озвучка получена! Скачиваю файл...");
 
     const file = await ctx.api.getFile(message.audio?.file_id || message.document?.file_id);
-    if (!file.file_path) throw new Error("Telegram не вернул путь к файлу озвучки.");
-
     const telegramFileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const response = await fetch(telegramFileUrl);
-    if (!response.ok) {
-      throw new Error(`Не удалось скачать озвучку из Telegram: HTTP ${response.status}`);
-    }
+    
     const audioBuffer = Buffer.from(await response.arrayBuffer());
-    if (!audioBuffer.length) throw new Error("Telegram вернул пустой файл озвучки.");
     fs.writeFileSync(localPath, audioBuffer);
 
     const voiceoverUrl = await uploadToStorage(localPath, "short-voiceovers");
 
-    const { error: updateError } = await supabase
+    await supabase
       .from("shorts")
       .update({ status: "voice_received", voiceover_audio_url: voiceoverUrl })
       .eq("id", shortId);
-
-    if (updateError) throw new Error(`Не удалось сохранить озвучку: ${updateError.message}`);
 
     ctx.session.step = "awaiting_visual_choice";
     ctx.session.shortDraft = { shortId, script, voiceoverUrl };
@@ -677,34 +626,23 @@ async function handleShortVoiceUpload(ctx) {
     const kb = new InlineKeyboard()
       .text("📁 Свои фото/видео", "visuals_custom")
       .text("🤖 Подобрать автоматически", "visuals_auto");
-    await ctx.reply(
-      `Озвучка получена (${script.segments.length} сегментов). Визуал для роликов — свой или подобрать со стоков автоматически?`,
-      { reply_markup: kb }
-    );
+    await ctx.reply(`Озвучка получена. Визуал для роликов — свой или подобрать со стоков?`, { reply_markup: kb });
 
     return true;
   } catch (err) {
-    console.error("Ошибка сборки short после загрузки озвучки:", err);
     await releaseShortBuildLock(shortId, { status: "error", error: err.message });
-    await ctx.reply(`❌ Не удалось собрать TikTok.\n\n${err.message}\n\nНажми /replay, чтобы попробовать ещё раз.`);
+    await ctx.reply(`❌ Ошибка загрузки озвучки.\n\n${err.message}`);
     return true;
   } finally {
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
 }
 
-bot.on("message:audio", async (ctx) => {
-  await handleShortVoiceUpload(ctx);
-});
+bot.on("message:audio", async (ctx) => { await handleShortVoiceUpload(ctx); });
+bot.on("message:document", async (ctx) => { await handleShortVoiceUpload(ctx); });
 
-bot.on("message:document", async (ctx) => {
-  await handleShortVoiceUpload(ctx);
-});
-
-// ---------- Текстовые сообщения ----------
 bot.on("message:text", async (ctx, next) => {
   if (ctx.message.text.startsWith("/")) return next();
-
   const step = ctx.session.step;
 
   if (step === "awaiting_draft_text" || step === "awaiting_theme") {
@@ -712,13 +650,11 @@ bot.on("message:text", async (ctx, next) => {
     await ctx.reply("Дорабатываю сценарий...");
 
     const maxScenes = estimateMaxScenes();
-
     let script;
     try {
       script = await generateScript({ userInput: ctx.message.text, isDraft, maxScenes });
     } catch (err) {
-      console.error("Ошибка генерации сценария:", err);
-      await ctx.reply("Gemini сейчас перегружен. Попробуй ещё раз через минуту — просто пришли текст заново.");
+      await ctx.reply("Gemini сейчас перегружен. Попробуй ещё раз через минуту.");
       return;
     }
 
@@ -755,135 +691,70 @@ bot.on("message:text", async (ctx, next) => {
 
 async function runShortPipeline(ctx, rawInput) {
   let script;
-
-  const { data: learnedStyles } = await supabase
-    .from("short_styles")
-    .select("style_profile")
-    .eq("telegram_id", ctx.from.id)
-    .order("created_at", { ascending: false })
-    .limit(5);
+  const { data: learnedStyles } = await supabase.from("short_styles").select("style_profile").eq("telegram_id", ctx.from.id).order("created_at", { ascending: false }).limit(5);
   const styleProfiles = (learnedStyles || []).map((r) => r.style_profile);
 
   try {
     if (isUrl(rawInput)) {
       await ctx.reply("Загружаю статью по ссылке...");
       const { text: articleText, ogImage } = await fetchArticle(rawInput);
-      if (!articleText || articleText.length < 200) {
-        await ctx.reply("Не получилось вытащить достаточно текста. Пришли текст статьи.");
-        return;
-      }
       ctx.session.shortDraft = { ogImage };
-      await ctx.reply("Статья загружена, пишу сценарий...");
       script = await generateShortScript({ input: articleText, isArticle: true, styleProfiles });
     } else {
       await ctx.reply("Пишу сценарий...");
       script = await generateShortScript({ input: rawInput, isArticle: false, styleProfiles });
     }
   } catch (err) {
-    console.error("Ошибка генерации сценария short:", err);
     await ctx.reply("Не получилось сгенерировать сценарий. Попробуй ещё раз.");
     return;
   }
 
   const cleanScript = script.segments.map(s => s.narration).join(" ");
-
   const { data: shortRecord, error: insertError } = await supabase
     .from("shorts")
-    .insert({
-      telegram_id: ctx.from.id,
-      title: script.title,
-      type: script.type,
-      script,
-      status: "awaiting_voice",
-    })
-    .select()
-    .single();
+    .insert({ telegram_id: ctx.from.id, title: script.title, type: script.type, script, status: "awaiting_voice" })
+    .select().single();
 
   if (insertError || !shortRecord) {
-    console.error("Ошибка сохранения short:", insertError);
-    await ctx.reply("❌ Сценарий создан, но не удалось сохранить задачу. Попробуй /new_short ещё раз.");
+    await ctx.reply("❌ Не удалось сохранить задачу. Попробуй /new_short ещё раз.");
     return;
   }
 
-  ctx.session.shortDraft = {
-    shortId: shortRecord.id,
-    script,
-    ogImage: ctx.session.shortDraft?.ogImage || null,
-  };
+  ctx.session.shortDraft = { shortId: shortRecord.id, script, ogImage: ctx.session.shortDraft?.ogImage || null };
   ctx.session.step = "awaiting_short_voice";
 
   await ctx.reply(
-    `🎬 **Сценарий готов!**\n\n` +
-    `${cleanScript}\n\n` +
-    `🔊 **Теперь сделай озвучку:**\n` +
-    `1. Открой ElevenLabs.\n` +
-    `2. Вставь этот текст.\n` +
-    `3. Скачай готовую озвучку в MP3, WAV или M4A.\n` +
-    `4. Пришли файл сюда в этот чат.\n\n` +
-    `🔗 [Открыть ElevenLabs](https://elevenlabs.io/app/speech-synthesis)\n\n` +
-    `⏳ После получения файла я сам соберу: визуал + твою озвучку + музыку + субтитры и пришлю готовый TikTok.`
+    `🎬 **Сценарий готов!**\n\n${cleanScript}\n\n🔊 Сделай озвучку в ElevenLabs, скачай файл и пришли его сюда.`
   );
 }
+
 async function askLocationStep(ctx) {
   const { locations, locationQueueIndex } = ctx.session.draft;
-  if (locationQueueIndex >= locations.length) {
-    return askCharacterChoice(ctx);
-  }
+  if (locationQueueIndex >= locations.length) return askCharacterChoice(ctx);
   const loc = locations[locationQueueIndex];
-  const kb = new InlineKeyboard()
-    .text("Сгенерировать ИИ", "loc_ai")
-    .text("Своё фото", "loc_photo")
-    .row()
-    .text("Своё описание", "loc_desc");
+  const kb = new InlineKeyboard().text("Сгенерировать ИИ", "loc_ai").text("Своё фото", "loc_photo").row().text("Своё описание", "loc_desc");
   await ctx.reply(`Локация «${loc.name}»: ${loc.description}\n\nКак задать фон для неё?`, { reply_markup: kb });
 }
 
 async function askCharacterChoice(ctx) {
   ctx.session.step = "awaiting_character_choice";
-  const script = ctx.session.draft.script;
-  const kb = new InlineKeyboard()
-    .text("Свои персонажи (пришлю фото)", "chars_own")
-    .text("Сгенерировать персонажей", "chars_ai");
-  const charList = script.characters.map((c) => c.name).join(", ");
+  const kb = new InlineKeyboard().text("Свои персонажи (пришлю фото)", "chars_own").text("Сгенерировать персонажей", "chars_ai");
+  const charList = ctx.session.draft.script.characters.map((c) => c.name).join(", ");
   await ctx.reply(`Персонажи в сюжете: ${charList}\n\nПерсонажей — свои или сгенерировать?`, { reply_markup: kb });
 }
 
-bot.callbackQuery("loc_ai", async (ctx) => {
-  await safeAnswer(ctx);
-  ctx.session.draft.locationQueueIndex += 1;
-  await askLocationStep(ctx);
-});
-
-bot.callbackQuery("loc_photo", async (ctx) => {
-  await safeAnswer(ctx);
-  ctx.session.step = "awaiting_location_photo";
-  await ctx.reply("Пришли фото фона для этой локации.");
-});
-
-bot.callbackQuery("loc_desc", async (ctx) => {
-  await safeAnswer(ctx);
-  ctx.session.step = "awaiting_location_description";
-  await ctx.reply("Опиши локацию своими словами — сгенерирую фон по этому описанию.");
-});
-
-bot.callbackQuery("chars_own", async (ctx) => {
-  ctx.session.step = "awaiting_character_photos";
-  ctx.session.draft.characters = [];
-  await safeAnswer(ctx);
-  const names = ctx.session.draft.script.characters.map((c) => c.name).join(", ");
-  await ctx.reply(`Пришли фото персонажа(ей) по одному (${names}). После каждого фото выберешь, кто это. В конце — /done.`);
-});
-
+bot.callbackQuery("loc_ai", async (ctx) => { await safeAnswer(ctx); ctx.session.draft.locationQueueIndex += 1; await askLocationStep(ctx); });
+bot.callbackQuery("loc_photo", async (ctx) => { await safeAnswer(ctx); ctx.session.step = "awaiting_location_photo"; await ctx.reply("Пришли фото фона."); });
+bot.callbackQuery("loc_desc", async (ctx) => { await safeAnswer(ctx); ctx.session.step = "awaiting_location_description"; await ctx.reply("Опиши локацию словами."); });
+bot.callbackQuery("chars_own", async (ctx) => { await safeAnswer(ctx); ctx.session.step = "awaiting_character_photos"; ctx.session.draft.characters = []; await ctx.reply("Пришли фото персонажа(ей) по одному. В конце — /done."); });
 bot.callbackQuery("chars_ai", async (ctx) => {
   await safeAnswer(ctx);
   await ctx.reply("Генерирую всех персонажей по описанию из сценария через Pollinations...");
   try {
-    const characters = await generateCharacterImages(ctx.session.draft.script.characters);
-    ctx.session.draft.characters = characters;
+    ctx.session.draft.characters = await generateCharacterImages(ctx.session.draft.script.characters);
     await confirmAndEstimateCredits(ctx);
   } catch (err) {
-    console.error("Ошибка генерации персонажей:", err);
-    await ctx.reply("Парсер не ответил (или возникла ошибка).", { parse_mode: "Markdown" });
+    await ctx.reply("Ошибка парсера.");
   }
 });
 
@@ -891,10 +762,7 @@ bot.on("message:photo", async (ctx) => {
   if (ctx.session.step === "awaiting_location_photo") {
     const fileId = ctx.message.photo.at(-1).file_id;
     const file = await ctx.api.getFile(fileId);
-    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-
-    const idx = ctx.session.draft.locationQueueIndex;
-    ctx.session.draft.locations[idx].image_url = url;
+    ctx.session.draft.locations[ctx.session.draft.locationQueueIndex].image_url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     ctx.session.draft.locationQueueIndex += 1;
     ctx.session.step = "awaiting_location_step";
     await ctx.reply("Фон сохранён.");
@@ -903,25 +771,17 @@ bot.on("message:photo", async (ctx) => {
   }
 
   if (ctx.session.step !== "awaiting_character_photos") return;
-
   const fileId = ctx.message.photo.at(-1).file_id;
   const file = await ctx.api.getFile(fileId);
-  const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-  ctx.session.draft.pendingPhotoUrl = url;
+  ctx.session.draft.pendingPhotoUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
   const allNames = ctx.session.draft.script.characters.map((c) => c.name);
   const remaining = allNames.filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
 
-  if (remaining.length === 0) {
-    await ctx.reply("Все персонажи уже собраны. Можно жать /done.");
-    return;
-  }
+  if (remaining.length === 0) { await ctx.reply("Все персонажи уже собраны. Можно жать /done."); return; }
 
   const kb = new InlineKeyboard();
-  remaining.forEach((name, i) => {
-    kb.text(name, `char_pick:${allNames.indexOf(name)}`);
-    if (i % 2 === 1) kb.row();
-  });
+  remaining.forEach((name, i) => { kb.text(name, `char_pick:${allNames.indexOf(name)}`); if (i % 2 === 1) kb.row(); });
   await ctx.reply("Кто это?", { reply_markup: kb });
 });
 
@@ -931,40 +791,22 @@ bot.callbackQuery(/^char_pick:/, async (ctx) => {
   const name = ctx.session.draft.script.characters[idx]?.name;
   const pendingPhoto = ctx.session.draft.pendingPhotoUrl;
   
-  if (!name || !pendingPhoto) {
-    await ctx.reply("Что-то пошло не так, пришли фото ещё раз.");
-    return;
-  }
+  if (!name || !pendingPhoto) return ctx.reply("Что-то пошло не так, пришли фото ещё раз.");
 
   ctx.session.draft.characters.push({ name, source: "user_upload", ref_image_url: pendingPhoto });
+  const remaining = ctx.session.draft.script.characters.map((c) => c.name).filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
 
-  const remaining = ctx.session.draft.script.characters
-    .map((c) => c.name)
-    .filter((n) => !ctx.session.draft.characters.some((c) => c.name === n));
-
-  if (remaining.length > 0) {
-    await ctx.reply(`Добавлен персонаж "${name}". Осталось: ${remaining.join(", ")}.\nПришли следующее фото, или /done.`);
-  } else {
-    await ctx.reply(`Все персонажи собраны. Можно жать /done.`);
-  }
+  if (remaining.length > 0) await ctx.reply(`Добавлен "${name}". Осталось: ${remaining.join(", ")}.\nПришли следующее фото, или /done.`);
+  else await ctx.reply(`Все персонажи собраны. Можно жать /done.`);
 });
 
 bot.command("done", async (ctx) => {
   if (ctx.session.step !== "awaiting_character_photos") return;
-
-  const scriptCharacters = ctx.session.draft.script.characters;
-  const haveNames = ctx.session.draft.characters.map((c) => c.name);
-  const missing = scriptCharacters.filter((c) => !haveNames.includes(c.name));
+  const missing = ctx.session.draft.script.characters.filter((c) => !ctx.session.draft.characters.map((x) => x.name).includes(c.name));
 
   if (missing.length > 0) {
-    await ctx.reply(`Дособираю недостающих персонажей через ИИ (${missing.map((c) => c.name).join(", ")})...`);
-    try {
-      const generated = await generateCharacterImages(missing);
-      ctx.session.draft.characters.push(...generated);
-    } catch (err) {
-      await ctx.reply("Ошибка генерации. Пришли фото для оставшихся вручную.");
-      return;
-    }
+    await ctx.reply(`Дособираю недостающих персонажей через ИИ...`);
+    try { ctx.session.draft.characters.push(...await generateCharacterImages(missing)); } catch (err) { return ctx.reply("Ошибка генерации. Пришли фото вручную."); }
   }
   await confirmAndEstimateCredits(ctx);
 });
@@ -978,23 +820,17 @@ async function confirmAndEstimateCredits(ctx) {
     const kb = new InlineKeyboard().text("Генерировать видео", "confirm_generate");
 
     await ctx.reply(
-      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео, ${ctx.session.draft.characters.length} персонажей.\n\n💰 Стоимость: **БЕСПЛАТНО** (Digen AI + Pollinations.ai)\n\nПодтверждаешь генерацию?`,
+      `Эпизод: ${scenes.length} сцен, ${totalSeconds} сек видео.\n\n💰 Стоимость: **БЕСПЛАТНО** (Digen AI + Pollinations.ai)\n\nПодтверждаешь генерацию?`,
       { reply_markup: kb, parse_mode: "Markdown" }
     );
-  } catch (err) {
-    await ctx.reply("Что-то пошло не так при подсчёте. Попробуй /new_episode заново.");
-  }
+  } catch (err) { await ctx.reply("Ошибка при подсчёте. Попробуй /new_episode заново."); }
 }
 
 bot.callbackQuery("confirm_generate", async (ctx) => {
   await safeAnswer(ctx);
 
   const telegramId = ctx.from.id;
-  const activeLock = await getActiveGeneration(telegramId);
-  if (activeLock) {
-    await ctx.reply(describeActiveGeneration(activeLock));
-    return;
-  }
+  if (await getActiveGeneration(telegramId)) return ctx.reply(describeActiveGeneration(await getActiveGeneration(telegramId)));
 
   await ctx.reply("🎬 Начинаю генерацию. Это займет несколько минут...");
 
@@ -1008,19 +844,16 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
       locations: ctx.session.draft.locations || [],
       status: "processing",
     })
-    .select()
-    .single();
+    .select().single();
 
-  const gotLock = await acquireGenerationLock(telegramId, "episode", episode.id, episode.title);
-  if (!gotLock) {
-    await ctx.reply(describeActiveGeneration(await getActiveGeneration(telegramId)));
-    return;
+  if (!(await acquireGenerationLock(telegramId, "episode", episode.id, episode.title))) {
+    return ctx.reply(describeActiveGeneration(await getActiveGeneration(telegramId)));
   }
 
   processEpisode(ctx, episode)
     .catch((err) => {
       console.error("Необработанная ошибка в processEpisode:", err);
-      ctx.reply("Что-то пошло не так во время генерации. Попробуй /new_episode заново.").catch(() => {});
+      ctx.reply("Что-то пошло не так. Попробуй /new_episode заново.").catch(() => {});
     })
     .finally(() => releaseGenerationLock(telegramId));
 });
@@ -1028,21 +861,13 @@ bot.callbackQuery("confirm_generate", async (ctx) => {
 async function processEpisode(ctx, episode) {
   const scenes = episode.script.scenes;
   const characters = episode.characters;
-
-  const locations = episode.locations && episode.locations.length > 0
-    ? episode.locations
-    : (episode.script.locations || []).map((l) => ({ ...l, image_url: null }));
+  const locations = episode.locations && episode.locations.length > 0 ? episode.locations : (episode.script.locations || []).map((l) => ({ ...l, image_url: null }));
 
   const missingLocations = locations.filter((l) => !l.image_url);
   if (missingLocations.length > 0) {
-    await ctx.reply(`Готовлю фон для локаций через Pollinations (${missingLocations.map((l) => l.name).join(", ")})...`);
+    await ctx.reply(`Готовлю фон для локаций...`);
     for (const loc of missingLocations) {
-      try {
-        loc.image_url = await generateLocationImage(loc.description);
-      } catch (err) {
-        console.error(`Не удалось сгенерировать фон локации "${loc.name}":`, err.message);
-        await ctx.reply(`⚠️ Не получилось сгенерировать фон для локации "${loc.name}": ${err.message}`);
-      }
+      try { loc.image_url = await generateLocationImage(loc.description); } catch (err) { await ctx.reply(`⚠️ Ошибка фона "${loc.name}": ${err.message}`); }
     }
     await supabase.from("episodes").update({ locations }).eq("id", episode.id);
   }
@@ -1065,14 +890,12 @@ async function processEpisode(ctx, episode) {
   const existingByNumber = new Map((existingScenes || []).map((s) => [s.scene_number, s]));
   let voiceoverFailWarned = false;
 
-  const sceneCharacterNames = (scene) =>
-    [scene.primary_character, ...(scene.secondary_characters || [])].filter(Boolean);
+  const sceneCharacterNames = (scene) => [scene.primary_character, ...(scene.secondary_characters || [])].filter(Boolean);
 
   try {
     for (let i = 0; i < scenes.length; i++) {
       if (cancelledResources.has(episode.id)) {
         cancelledResources.delete(episode.id);
-        console.log(`Эпизод ${episode.id} остановлен через /cancel, прерываю цикл сцен.`);
         return;
       }
       const scene = scenes[i];
@@ -1081,11 +904,7 @@ async function processEpisode(ctx, episode) {
 
       let record = existingByNumber.get(sceneNumber);
       if (!record) {
-        // Просто генерируем референс через Pollinations для БД
-        const referenceImageUrl = await generateSceneReferenceImage(
-            null, [], scene.character_position || "in the scene", scene.shot_type || "medium close-up"
-        );
-
+        const referenceImageUrl = await generateSceneReferenceImage(null, [], scene.character_position || "in the scene", scene.shot_type || "medium close-up");
         const { data: newScene, error: insertSceneError } = await supabase
           .from("scenes")
           .insert({
@@ -1099,13 +918,11 @@ async function processEpisode(ctx, episode) {
           })
           .select().single();
 
-        if (insertSceneError || !newScene) {
-          throw new Error(`Не удалось сохранить сцену ${sceneNumber} в базу: ${insertSceneError?.message || "неизвестная ошибка"}`);
-        }
+        if (insertSceneError || !newScene) throw new Error("Не удалось сохранить сцену");
         record = newScene;
 
         if (digenReady) {
-          // --- ЗАПУСКАЕМ DIGEN В ФОНЕ (Асинхронно, чтобы не блочить луп) ---
+          // Запускаем Digen в фоне
           (async () => {
              try {
                  await supabase.from("scenes").update({ video_status: "processing", last_attempt_at: new Date().toISOString() }).eq("id", record.id);
@@ -1116,7 +933,6 @@ async function processEpisode(ctx, episode) {
                  await supabase.from("scenes").update({ video_status: "failed" }).eq("id", record.id);
              }
           })();
-          // -----------------------------------------------------------------
         }
       }
 
@@ -1124,32 +940,24 @@ async function processEpisode(ctx, episode) {
         try {
           const speakerName = scene.speaker || sceneCharacterNames(scene)[0] || null;
           const speakerDescription = speakerName ? (episode.script.characters || []).find((c) => c.name === speakerName)?.description : null;
-          
           const audioUrl = await generateVoiceover(scene.voiceover_text, speakerDescription || speakerName || "");
-
           await supabase.from("scenes").update({ voiceover_audio_url: audioUrl }).eq("id", record.id);
           record.voiceover_audio_url = audioUrl;
         } catch (err) {
-          console.error(`Ошибка озвучки (Сцена ${sceneNumber}):`, err.message);
-          if (!voiceoverFailWarned) {
-             await ctx.reply("Возникли проблемы с озвучкой некоторых сцен. Они останутся без голоса.");
-             voiceoverFailWarned = true;
-          }
+          if (!voiceoverFailWarned) { await ctx.reply("Возникли проблемы с озвучкой некоторых сцен."); voiceoverFailWarned = true; }
         }
       }
     }
     
-    // Ждем пока все фоновые Digen задачи в базе перейдут в completed/failed
     await pollScenes(ctx, episode.id);
 
   } catch (error) {
     console.error("Критическая ошибка в processEpisode:", error);
     await supabase.from("episodes").update({ status: "error" }).eq("id", episode.id);
-    await ctx.reply("Генерация прервалась из-за ошибки. Возобнови её с помощью /replay.");
+    await ctx.reply("Генерация прервалась. Возобнови её с помощью /replay.");
   }
 }
 
-// Новый pollScenes, который тупо ждет обновления статусов из асинхронных задач Digen
 async function pollScenes(ctx, episodeId) {
   let isDone = false;
   let compositeWarned = false;
@@ -1162,12 +970,10 @@ async function pollScenes(ctx, episodeId) {
 
     if (cancelledResources.has(episodeId)) {
       cancelledResources.delete(episodeId);
-      console.log(`Эпизод ${episodeId} остановлен через /cancel, прерываю опрос сцен.`);
       return;
     }
 
     const { data: scenes } = await supabase.from("scenes").select("*").eq("episode_id", episodeId);
-    
     const pending = scenes.filter((s) => s.video_status === "processing" || s.video_status === "pending");
 
     if (pending.length > 0 && cycle % 4 === 0) {
@@ -1194,25 +1000,16 @@ async function pollScenes(ctx, episodeId) {
 
       await ctx.reply("Все видео готовы! Начинаю склейку и удаление водяного знака...");
       try {
-        const { localPath: finalPath, publicUrl } = await assembleEpisode(validScenes, episodeId);
+        const { localPath: finalPath, publicUrl } = await assembleEpisode(validScenes);
         await supabase.from("episodes").update({ status: "completed", final_video_url: publicUrl }).eq("id", episodeId);
 
         try {
-          await ctx.replyWithVideo(publicUrl, {
-            caption: "✅ Готово! Твой сериал от Digen.\n\nНачать новый — /new_episode.",
-          });
+          await ctx.replyWithVideo(publicUrl, { caption: "✅ Готово! Твой сериал от Digen.\n\nНачать новый — /new_episode." });
         } catch (sendErr) {
-          console.warn("Отправка эпизода по ссылке не удалась, пробую загрузить файл напрямую:", sendErr.message);
-          await ctx.replyWithVideo(new InputFile(finalPath), {
-            caption: "✅ Готово! Твой сериал от Digen.\n\nНачать новый — /new_episode.",
-          });
+          await ctx.replyWithVideo(new InputFile(finalPath), { caption: "✅ Готово! Твой сериал от Digen.\n\nНачать новый — /new_episode." });
         }
-
-        try {
-          fs.rmSync(path.dirname(finalPath), { recursive: true, force: true });
-        } catch (cleanupError) {}
+        try { fs.rmSync(path.dirname(finalPath), { recursive: true, force: true }); } catch (cleanupError) {}
       } catch (err) {
-        console.error("Ошибка сборки:", err);
         await supabase.from("episodes").update({ status: "error", error: err.message }).eq("id", episodeId);
         await ctx.reply("Видео готовы, но не получилось собрать (FFmpeg). Попробуй /replay позже.");
       }
@@ -1233,10 +1030,7 @@ app.use(express.json());
 app.get("/", (req, res) => res.send("Bot is running"));
 app.use(webhookCallback(bot, "express", { timeoutMilliseconds: 60_000 }));
 
-bot.catch((err) => {
-  console.error(`Необработанная ошибка в апдейте ${err.ctx.update.update_id}:`, err.error);
-});
-
+bot.catch((err) => console.error(`Необработанная ошибка:`, err.error));
 process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 const PORT = process.env.PORT || 3000;
@@ -1245,12 +1039,8 @@ app.listen(PORT, async () => {
   const publicUrl = process.env.RENDER_EXTERNAL_URL;
   if (publicUrl) {
     await bot.api.setWebhook(publicUrl);
-    console.log("Webhook set to", publicUrl);
-    setInterval(() => {
-      fetch(publicUrl).catch((err) => console.warn("Self-ping не удался:", err.message));
-    }, 10 * 60 * 1000);
+    setInterval(() => fetch(publicUrl).catch((err) => console.warn("Self-ping не удался:", err.message)), 10 * 60 * 1000);
   } else {
     bot.start(); 
-    console.log("Started long polling mode");
   }
 });
